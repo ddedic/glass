@@ -17,6 +17,7 @@ mod files;
 mod forward;
 mod grants;
 mod gamepad;
+mod idle;
 mod ipc;
 mod keys;
 mod ldap;
@@ -106,6 +107,11 @@ struct Args {
     /// overrides `glass config bind`.
     #[arg(long, value_name = "ADDR", value_delimiter = ',')]
     bind: Vec<String>,
+    /// Quit after this many minutes with no viewer, stream or terminal session. A session
+    /// that is still open is left alone, and the clock starts over when it ends. `0` stays
+    /// up. When set, overrides `glass config exit-after-idle` for this run. Off by default.
+    #[arg(long, value_name = "MINUTES")]
+    exit_after_idle: Option<u32>,
     /// Capture frame rate cap. Viewers get 60, or up to 120 on a fast screen (macOS).
     #[arg(long, default_value_t = 120)]
     fps: i32,
@@ -1309,6 +1315,7 @@ async fn run_host(args: Args) -> Result<()> {
         });
     }
     info!("open {url}#t={token}");
+    idle::watch(args.exit_after_idle);
     server::run(
         shared,
         paths.web_dir,
@@ -1396,6 +1403,20 @@ mod tests {
             listen::parse_bind(&args.bind).unwrap(),
             vec!["127.0.0.1", "::1", "tailscale"]
         );
+    }
+
+    #[test]
+    fn exit_after_idle_is_optional_minutes() {
+        let absent = Args::try_parse_from(["glass"]).unwrap();
+        assert_eq!(absent.exit_after_idle, None);
+        let set = Args::try_parse_from(["glass", "--exit-after-idle", "15"]).unwrap();
+        assert_eq!(set.exit_after_idle, Some(15));
+        assert!(Args::try_parse_from(["glass", "--exit-after-idle", "soon"]).is_err());
+        assert_eq!(
+            idle::minutes(set.exit_after_idle, 30),
+            15
+        );
+        assert_eq!(idle::minutes(absent.exit_after_idle, 30), 30);
     }
 
     #[test]

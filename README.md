@@ -153,8 +153,9 @@ glass acl add @example.com                     # wins: email, @domain, group:nam
 glass acl / glass acl remove 0                 # list; remove by position
 glass config scim-token new   # SCIM provisioning at https://<computer>/scim/v2 (Okta, Entra ID):
                          # deactivated users can't sign in and lose their sessions
-glass config             # settings: ask-guests, record, privacy, hevc, forward-ports, bind, name, accent, relay…
+glass config             # settings: ask-guests, record, privacy, hevc, forward-ports, bind, exit-after-idle, name, accent, relay…
                          # bind: listen addresses (default 0.0.0.0). On macOS, port 443 needs the default or 0.0.0.0.
+                         # exit-after-idle: minutes with nobody connected before Glass quits (off by default)
 glass mcp                # MCP server: an AI agent uses this computer while you watch
                          # (claude mcp add glass -- glass mcp; --machine mac-mini for another)
 glass agents             # agents from anywhere: list, revoke ID|all, install CLIENT, log, verify,

@@ -1688,6 +1688,8 @@ const ASK_HOLD_DEFAULT: u64 = 20;
 const ASK_HOLD_MAX: u64 = 50;
 
 async fn run_tool(g: &Grant, name: &str, args: &Value) -> Result<Vec<Value>, String> {
+    // Hold the host until this call finishes, including a question waiting on the owner.
+    let _idle = crate::idle::SessionGuard::enter();
     use crate::mcp::{Show, Step};
     let mut args = args.clone();
     if matches!(name, "confirm" | "request_help" | "check_answer") {

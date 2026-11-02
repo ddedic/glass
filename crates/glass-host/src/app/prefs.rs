@@ -18,6 +18,7 @@ const TEXT: &[&str] = &[
     "relay",
     "forward-ports",
     "bind",
+    "exit-after-idle",
     "name",
     "accent",
     "oidc-issuer",
@@ -158,6 +159,12 @@ impl GlassApp {
                 "bind",
                 "Listen addresses",
                 "Where Glass accepts connections. Blank (shown as 0.0.0.0) is every IPv4 address. tailscale is this Mac's Tailscale addresses, or list them: 127.0.0.1, 100.64.0.2. On macOS, port 443 needs the default bind or 0.0.0.0. Restart to apply.",
+                cx,
+            ),
+            self.field(
+                "exit-after-idle",
+                "Exit after idle",
+                "Minutes with no viewer before Glass quits. Blank or off stays up. A connected viewer, its stream or its terminal is never cut off.",
                 cx,
             ),
         ];
@@ -393,6 +400,7 @@ fn example(key: &str) -> String {
         "relay" => "https://glass.example.com".into(),
         "forward-ports" => "3000, 8888".into(),
         "bind" => "tailscale, 127.0.0.1".into(),
+        "exit-after-idle" => "30".into(),
         "name" => "Studio Mac".into(),
         "accent" => "#5cb2ff".into(),
         "recordings-dir" => "~/Movies/Glass".into(),

@@ -314,6 +314,9 @@ fn wt_server_config(
 }
 
 async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
+    // Counts from the handshake on, so idle exit can't drop a viewer, its stream or its
+    // terminal, including one that is still signing in.
+    let _idle = crate::idle::SessionGuard::enter();
     let request = incoming.await?;
     // A WebRTC viewer arrives through the local bridge, which vouches for its real address.
     let relayed = crate::remote::relayed_peer(request.path());

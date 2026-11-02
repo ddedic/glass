@@ -31,6 +31,9 @@ pub struct Settings {
     /// Addresses to listen on (IPs, or `tailscale`). Empty: `0.0.0.0` for TCP, and
     /// WebTransport's dual-stack default. Applied the next time the host starts.
     pub bind: Vec<String>,
+    /// Quit after this many minutes with nobody connected. 0 stays up. Read while the
+    /// host runs, unless `--exit-after-idle` was passed.
+    pub exit_after_idle: u32,
     /// Name shown in the viewer instead of the computer's (branding).
     pub name: Option<String>,
     /// Accent colour for the viewer, as #rrggbb (branding).
@@ -173,6 +176,10 @@ pub const KEYS: &[(&str, &str)] = &[
         "bind",
         "listen addresses, comma-separated (or tailscale); default 0.0.0.0; on macOS, port 443 needs the default or 0.0.0.0; applies on restart",
     ),
+    (
+        "exit-after-idle",
+        "minutes with no viewer before Glass quits (0 or off stays up; a connected session is never cut off)",
+    ),
     ("name", "name shown in the viewer"),
     ("accent", "viewer accent colour, e.g. #ff8800"),
     ("relay", "self-hosted remote-access server, e.g. https://glass.example.com"),
@@ -264,6 +271,13 @@ impl Settings {
                     self.bind.join(",")
                 }
             }
+            "exit-after-idle" => {
+                if self.exit_after_idle == 0 {
+                    "off".into()
+                } else {
+                    self.exit_after_idle.to_string()
+                }
+            }
             "name" => self.name.clone().unwrap_or_default(),
             "accent" => self.accent.clone().unwrap_or_default(),
             "relay" => self.relay.clone().unwrap_or_default(),
@@ -329,6 +343,7 @@ impl Settings {
                     self.bind = parsed;
                 }
             }
+            "exit-after-idle" => self.exit_after_idle = crate::idle::parse_minutes(value)?,
             "name" => {
                 let name: String = value.chars().filter(|c| !c.is_control()).take(40).collect();
                 self.name = (!name.is_empty()).then_some(name);
@@ -506,6 +521,13 @@ mod tests {
         assert!(s.set("bind", "127.0.0.1:8080").is_err());
         s.set("bind", "").unwrap();
         assert!(s.bind.is_empty());
+        assert_eq!(s.get("exit-after-idle").unwrap(), "off");
+        s.set("exit-after-idle", "15").unwrap();
+        assert_eq!(s.exit_after_idle, 15);
+        assert_eq!(s.get("exit-after-idle").unwrap(), "15");
+        s.set("exit-after-idle", "off").unwrap();
+        assert_eq!(s.exit_after_idle, 0);
+        assert!(s.set("exit-after-idle", "soon").is_err());
         // Unknown and missing fields are fine.
         let old: Settings = serde_json::from_str(r#"{"ask_guests":true,"future":1}"#).unwrap();
         assert!(old.ask_guests && !old.record);

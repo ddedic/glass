@@ -207,7 +207,7 @@ NSPasteboard, files ◀─▶ control + file streams ◀────────
 - Remote access from outside your tailnet is off until you make a link or run `glass remote on`.
 - Glass runs as your user, never as root. The app sends nothing to glassdesk.dev except feedback you choose to send, and, if you run `glass account add`, this computer's name and public key for your account's list (and, only if you also run `glass fleet on`, its model, system, memory, disk space, FileVault and firewall state, uptime, battery and Glass version).
 
-Found a security issue? Please open a [private security advisory](https://github.com/Ntarasiuk/glass/security/advisories/new) rather than a public issue.
+Found a security issue? Please see [SECURITY.md](SECURITY.md) and report it privately, not in a public issue.
 
 ## FAQ
 

@@ -2,6 +2,10 @@
 
 What changed in each release of Glass. `glass update` (or the Glass app) installs the newest; every build is on [GitHub Releases](https://github.com/Ntarasiuk/glass/releases).
 
+## Unreleased
+
+- On Windows, the inbound firewall rule Glass creates follows `glass config bind`. `tailscale` (or a Tailscale address) allows only `100.64.0.0/10` and `fd7a:115c:a1e0::/48` and blocks edge traversal. The default listen address is unchanged: private networks, any remote address. `glass setup` or `glass service install` applies it. A one-off `--bind` does not.
+
 ## 0.13.0
 
 November 3, 2026

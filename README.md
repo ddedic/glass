@@ -155,6 +155,7 @@ glass config scim-token new   # SCIM provisioning at https://<computer>/scim/v2 
                          # deactivated users can't sign in and lose their sessions
 glass config             # settings: ask-guests, record, privacy, hevc, forward-ports, bind, name, accent, relay…
                          # bind: listen addresses (default 0.0.0.0). On macOS, port 443 needs the default or 0.0.0.0.
+                         # On Windows, `glass setup` updates the firewall rule to match.
 glass mcp                # MCP server: an AI agent uses this computer while you watch
                          # (claude mcp add glass -- glass mcp; --machine mac-mini for another)
 glass agents             # agents from anywhere: list, revoke ID|all, install CLIENT, log, verify,

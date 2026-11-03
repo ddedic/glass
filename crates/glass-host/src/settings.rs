@@ -207,7 +207,11 @@ pub const KEYS: &[(&str, &str)] = &[
     ("forward-ports", "comma-separated ports owner devices may open, e.g. 3000,8888"),
     (
         "bind",
-        "listen addresses, comma-separated (or tailscale); default 0.0.0.0; on macOS, port 443 needs the default or 0.0.0.0; applies on restart",
+        if cfg!(windows) {
+            "listen addresses, comma-separated (or tailscale); default 0.0.0.0; applies on restart. On Windows, `glass setup` updates the firewall rule to match"
+        } else {
+            "listen addresses, comma-separated (or tailscale); default 0.0.0.0; on macOS, port 443 needs the default or 0.0.0.0; applies on restart"
+        },
     ),
     ("name", "name shown in the viewer"),
     ("accent", "viewer accent colour, e.g. #ff8800"),

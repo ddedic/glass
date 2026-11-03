@@ -79,13 +79,14 @@ impl GlassApp {
             }).await;
             let _ = cx.update(|window, cx| {
                 match r {
-                    Ok(_) => {
+                    Ok(note) => {
                         // Show it as stored (normalized, e.g. lowercased).
                         if !secret(key) {
                             let stored = settings::load().get(key).unwrap_or_default();
                             state.update(cx, |s, cx| s.set_value(stored, window, cx));
                         }
-                        super::toast(window, cx, Ok("Saved.".into()));
+                        let message = if note.is_empty() { "Saved.".into() } else { note };
+                        super::toast(window, cx, Ok(message));
                     }
                     Err(e) => super::toast(window, cx, Err(e)),
                 }
@@ -161,7 +162,11 @@ impl GlassApp {
             self.field(
                 "bind",
                 "Listen addresses",
-                "Where Glass accepts connections. Blank (shown as 0.0.0.0) is every IPv4 address. tailscale is this Mac's Tailscale addresses, or list them: 127.0.0.1, 100.64.0.2. On macOS, port 443 needs the default bind or 0.0.0.0. Restart to apply.",
+                if cfg!(windows) {
+                    "Where Glass accepts connections. Blank (shown as 0.0.0.0) is every IPv4 address. tailscale is this computer's Tailscale addresses, or list them: 127.0.0.1, 100.64.0.2. Restart to apply. glass setup updates the Windows Firewall rule to match."
+                } else {
+                    "Where Glass accepts connections. Blank (shown as 0.0.0.0) is every IPv4 address. tailscale is this Mac's Tailscale addresses, or list them: 127.0.0.1, 100.64.0.2. On macOS, port 443 needs the default bind or 0.0.0.0. Restart to apply."
+                },
                 cx,
             ),
         ];

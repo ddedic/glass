@@ -87,7 +87,7 @@ Windows shipped in 0.13.0 (beta); a ✅ there means it ran in a Windows 11 Arm V
 | Background service | ✅ LaunchAgent | ✅ systemd user | ✅ glassw at sign-in | |
 | Secure-desktop service (SYSTEM) | — | — | ✅ optional | `glass service install`; keeps a SYSTEM helper in the console session for the lock screen, UAC and Ctrl+Alt+Del. Host stays the only network/auth endpoint |
 | Self-update | ✅ | ✅ | ✅ | Windows MSI installs update with the MSI or winget; a policy can turn updates off |
-| Guided setup | ✅ | ✅ | ✅ (unattended) | Windows adds a firewall rule and offers the secure-desktop service (one UAC prompt each) |
+| Guided setup | ✅ | ✅ | ✅ (unattended) | Windows adds a firewall rule (private networks; Tailscale-only when `glass config bind` is tailscale) and offers the secure-desktop service (one UAC prompt each) |
 | Desktop app | ✅ Glass.app | ❌ | ✅ Start menu | Same window |
 | Status icon (who's viewing, quick controls) | ✅ menu bar | ❌ | ✅ notification area | |
 | CLI ↔ host channel | ✅ Unix socket | ✅ Unix socket | ✅ named pipe | |
@@ -95,3 +95,21 @@ Windows shipped in 0.13.0 (beta); a ✅ there means it ran in a Windows 11 Arm V
 | Fleet scripts | ✅ | ✅ | 🧪 .ps1/.cmd/.bat/.exe | |
 | Headless (no monitor) | — | 🚧 | ❌ | |
 | Recording to MP4, port forwarding, links, SSO/LDAP/SCIM, posture, relay, console | ✅ | ✅ | 🧪 | Platform-independent code. Windows: recording and one-time links work in the VM |
+
+## Windows Firewall
+
+Glass adds one inbound allow rule named **Glass** for each program that listens: the per-user `glass.exe`, the secure-desktop copy at `C:\Program Files\Glass\Service\glass.exe` (that copy is also the sign-in host), and `bin\glass.exe` from a per-machine MSI. `glassw.exe` does not listen and gets no rule. A rule with any other name is left alone, including outbound rules and block rules. Allow rules combine, so a wider allow under another name (for example the one Windows creates if its own prompt was accepted) still lets those addresses in. Glass says so and does not remove it.
+
+The rule follows the saved `glass config bind` (a Group Policy value included), not a one-off `--bind`. The firewall sees the other computer's address, so listening on this machine's Tailscale address still allows every Tailscale peer.
+
+| Saved bind | Inbound rule on the private profile |
+|---|---|
+| Default, `0.0.0.0`, `::`, or any LAN, VPN, or public address | Any remote address. This is the rule Glass has always created. A specific address outside Tailscale stays this wide: the private profile is the existing boundary, and those peers are not one fixed range. `localsubnet` would drop clients that reach the computer through a route or another VPN. |
+| `tailscale`, or a Tailscale address (`100.64.0.0/10` or `fd7a:115c:a1e0::/48`), plus optional loopback | Only `100.64.0.0/10` and `fd7a:115c:a1e0::/48`. Edge traversal is blocked. |
+| Only `127.0.0.1` / `::1` | No Glass allow rule. The firewall does not filter loopback. |
+
+Mixing a Tailscale address with any other non-loopback address uses the wide rule, because that other address accepts more than the tailnet.
+
+`glass config bind` does not ask for administrator approval. When the process is already elevated it updates the rule; otherwise it prints that `glass setup` will. `glass setup` asks once, as before, and updates every Glass program above. `glass service install` does the same update while it is already elevated (the installer runs it again when the service version changes). Running any of them again replaces a stale or wider rule named Glass for that program instead of adding a duplicate. A rule stored with edge traversal "defer to user" cannot take a remote-address filter, so Glass deletes that rule and creates a new one.
+
+The per-machine MSI installs the wide private-network rule, which matches the default bind. A major upgrade installs that wide rule again. Afterwards, run `glass setup` or `glass service install` if bind is `tailscale`. The exception is one per program, so on a shared MSI install the last user to apply a bind is the one that copy keeps.

@@ -13,6 +13,14 @@ pub fn set_setting(key: &str, value: &str) -> Result<String> {
     let mut s = settings::load();
     s.set(key, value)?;
     settings::save(&s)?;
+    // On Windows the firewall follows `bind`. Already-elevated processes apply it;
+    // otherwise the note says to run `glass setup`, with no approval prompt here.
+    #[cfg(windows)]
+    if key == "bind"
+        && let Some(note) = crate::platform::firewall::bind_change_note()
+    {
+        return Ok(note);
+    }
     Ok(String::new())
 }
 

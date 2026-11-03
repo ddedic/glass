@@ -86,10 +86,11 @@ fn install() -> Result<()> {
     }
     let exe = protected_copy()?;
     let bin = format!("\"{}\" {SERVICE_ARG}", exe.display());
-    // The sign-in host runs this copy: it needs its own firewall rule (private networks,
-    // like glass setup's), as SYSTEM can't answer Windows' prompt.
-    if super::firewall::inbound(&exe) != Some(super::firewall::Inbound::Allowed) && !super::firewall::add_rule_quietly(&exe) {
-        println!("Couldn't let the sign-in screen's Glass through Windows Firewall; viewers may not reach it.");
+    // The sign-in host is this copy, and the per-user host is the one running install.
+    // Both follow the saved bind. Already elevated, so this adds no prompt of its own,
+    // and a firewall failure doesn't undo the service.
+    for line in super::firewall::install_lines(&super::firewall::sync()) {
+        println!("{line}");
     }
     // The sign-in screen after a restart (signin.rs): this user's token and access rules.
     match copy_signin_settings() {

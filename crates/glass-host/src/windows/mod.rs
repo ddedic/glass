@@ -7,6 +7,7 @@ pub mod clipboard;
 pub mod clock;
 pub mod convert;
 pub mod firewall;
+mod firewall_scope;
 pub mod front;
 pub mod input;
 pub mod keymap;

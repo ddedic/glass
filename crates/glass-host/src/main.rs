@@ -79,6 +79,10 @@ mod platform;
 #[path = "windows/convert.rs"]
 #[allow(dead_code)]
 mod windows_convert;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/firewall_scope.rs"]
+#[allow(dead_code)]
+mod windows_firewall_scope;
 
 // Platform modules keep the same names everywhere, so shared code says `crate::input` etc.
 use platform::{agent, audio, clipboard, clock, input, permissions, video};
@@ -575,6 +579,14 @@ fn config_cli(key: Option<&str>, value: Option<&str>) -> Result<()> {
             s.set(k, v)?;
             settings::save(&s)?;
             println!("{k} = {}", s.get(k)?);
+            // The firewall follows the saved bind. Already-elevated processes apply it;
+            // otherwise this only prints how to, and does not ask for approval.
+            #[cfg(windows)]
+            if k == "bind"
+                && let Some(note) = platform::firewall::bind_change_note()
+            {
+                println!("{note}");
+            }
             // A generated token is shown once, to paste into the identity provider.
             if k == "scim-token" && v == "new"
                 && let Some(t) = settings::scim_token()
@@ -805,6 +817,7 @@ fn main() -> Result<()> {
             Some(platform::service::SERVICE_ARG) => return platform::service::run_service(),
             Some(platform::secure::HELPER_ARG) => return platform::secure::run_helper(),
             Some(platform::micdriver::ARG) => return platform::micdriver::cli(&argv[2..]),
+            Some(platform::firewall::SYNC_ARG) => return platform::firewall::run_sync(),
             _ => {}
         }
     }

@@ -5,8 +5,11 @@
   Built by scripts/package.ps1 with WiX Toolset 5 (wix build -arch x64|arm64 -d Version=…
   -d Stage=… -d Icon=…). Installs to Program Files\Glass with the zip's layout, starts glassw
   for each user who signs in (the HKLM Run key), adds the Start menu shortcut, puts glass on
-  the PATH and lets Glass through Windows Defender Firewall on private networks, as
-  `glass setup` would. The host finds this copy through HKLM\SOFTWARE\Glass InstallDir
+  the PATH and lets Glass through Windows Defender Firewall on private networks
+  (any remote address, matching the default `glass config bind`). A tailscale bind is
+  applied later by `glass setup` or `glass service install`: a major upgrade installs
+  this wide exception again, so that command has to be run afterwards. The host finds
+  this copy through HKLM\SOFTWARE\Glass InstallDir
   (src/windows/agent.rs). Settings stay in each user's profile and survive uninstalling.
 
   The UpgradeCode never changes: each new MSI replaces the one before (MajorUpgrade).
@@ -35,7 +38,9 @@
         <Directory Id="BinFolder" Name="bin">
           <Component Id="GlassExe">
             <File Id="GlassExe" Source="$(var.Stage)\bin\glass.exe" KeyPath="yes">
-              <!-- The rule `glass setup` adds: private networks (home, work, Tailscale) only. -->
+              <!-- Default bind: private profile, any remote address, no port. `glass setup`
+                   replaces it when bind is tailscale. Keep this shape or setup will
+                   rewrite the rule on every run for the default bind. -->
               <fw:FirewallException Id="GlassFirewall" Name="Glass" Profile="private" Scope="any" IgnoreFailure="yes" />
             </File>
             <Environment Id="GlassPath" Name="PATH" Value="[BinFolder]" Part="last" Action="set" System="yes" />

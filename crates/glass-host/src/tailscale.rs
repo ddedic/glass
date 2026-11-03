@@ -243,7 +243,9 @@ pub async fn ensure_cert(
     Some((cert, key))
 }
 
-fn is_tailscale_ip(ip: IpAddr) -> bool {
+/// `100.64.0.0/10` or `fd7a:115c:a1e0::/48`. Callers pass `IpAddr::to_canonical()` when
+/// the address might be an IPv4-mapped IPv6 form.
+pub(crate) fn is_tailscale_ip(ip: IpAddr) -> bool {
     match ip {
         // 100.64.0.0/10 (CGNAT range Tailscale assigns from)
         IpAddr::V4(v4) => v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64,

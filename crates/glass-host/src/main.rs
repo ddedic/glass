@@ -1316,7 +1316,7 @@ async fn run_host(args: Args) -> Result<()> {
             Box::new(testmode::FakeInput),
             Arc::new(testmode::FakeClipboard),
             // Who owns the computer on Tailscale, when a test says (see tailscale::identity).
-            std::env::var("GLASS_TEST_TAILNET_OWNER").ok(),
+            tailscale::TailnetOwner::fixed(std::env::var("GLASS_TEST_TAILNET_OWNER").ok()),
             None,
         )
     } else {
@@ -1369,16 +1369,11 @@ async fn run_host(args: Args) -> Result<()> {
         if !signin::active() {
             clipboard::watch(events.clone());
         }
-        let tailnet_owner = match tailscale::self_login().await {
-            Ok(login) => {
-                info!("tailnet devices owned by {login} connect without a token");
-                Some(login)
-            }
-            Err(e) => {
-                info!("tailscale unavailable ({e:#}); token required for all clients");
-                None
-            }
-        };
+        // Tailscale often isn't up yet (Windows, right after sign-in, or this sign-in host
+        // starting before tailscaled). The owner is filled in afterwards and re-checked, so a
+        // re-login or a tag takes effect without restarting. Unknown still means a token.
+        let tailnet_owner = tailscale::TailnetOwner::unknown();
+        tailnet_owner.watch();
         (
             video,
             Box::new(input::Injector::new(display.id)),

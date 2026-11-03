@@ -43,8 +43,9 @@ pub struct Shared {
     /// Failed sign-ins per address, for brute-force protection.
     pub auth_failures:
         Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
-    /// Tailnet login of this Mac's owner; their devices skip the token.
-    pub tailnet_owner: Option<String>,
+    /// Tailnet login of this computer's owner; their devices skip the token.
+    /// Updated after startup. Empty means unknown, tagged, or signed out: a token is required.
+    pub tailnet_owner: tailscale::TailnetOwner,
     pub audio: AudioPackets,
     pub rate: Mutex<crate::rate::RateControl>,
 }
@@ -575,7 +576,7 @@ async fn control(
         && ctx.relayed.is_none()
         && let Some(login) = tailscale::identity(peer).await
     {
-        if shared.tailnet_owner.as_deref() == Some(login.as_str()) {
+        if shared.tailnet_owner.resolve().await.as_deref() == Some(login.as_str()) {
             auth = Some(Auth::Tailnet);
         } else if let Some(scope) = tailnet_guest_scope(&login) {
             // Someone else on the tailnet: the access rules name them, or the owner lets the

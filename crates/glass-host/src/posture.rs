@@ -163,7 +163,10 @@ pub async fn check(peer: std::net::IpAddr, relayed: bool, ua: Option<&str>) -> R
     let tailnet = if relayed || crate::testmode::enabled() {
         None
     } else {
-        let owner = crate::server::shared().and_then(|s| s.tailnet_owner.clone());
+        let owner = match crate::server::shared() {
+            Some(shared) => shared.tailnet_owner.resolve().await,
+            None => None,
+        };
         crate::tailscale::whois(peer)
             .await
             .map(|w| tailnet_facts(&w, owner.as_deref()))

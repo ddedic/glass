@@ -2,6 +2,12 @@
 
 What changed in each release of Glass. `glass update` (or the Glass app) installs the newest; every build is on [GitHub Releases](https://github.com/Ntarasiuk/glass/releases).
 
+## Unreleased
+
+### Tailscale not ready yet
+
+- Your own tailnet devices connect without a token even when Tailscale isn't ready at the moment Glass starts (common right after signing in to Windows, or when the sign-in screen's Glass starts first). Glass keeps checking, and follows a later sign-in as someone else. A tagged device still asks for the token.
+
 ## 0.13.0
 
 November 3, 2026

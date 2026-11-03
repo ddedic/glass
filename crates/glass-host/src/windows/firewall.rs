@@ -1107,9 +1107,9 @@ mod tests {
         assert_eq!(NET_FW_IP_PROTOCOL_ANY.0, 256);
     }
 
-    /// Creates a wide Glass allow for a dummy executable, reconciles it to Tailscale,
-    /// then loopback, then wide again, and checks the firewall service itself. Gated so
-    /// a developer running the unit tests does not need to be an administrator.
+    /// Creates wide Glass allows for this test executable and a second copy, reconciles
+    /// them, and checks the firewall service itself. Gated so a developer running the
+    /// unit tests does not need to be an administrator.
     #[test]
     fn windows_reconcile_matches_the_firewall_service() {
         if std::env::var("GLASS_FIREWALL_INTEGRATION").ok().as_deref() != Some("1") {
@@ -1120,24 +1120,25 @@ mod tests {
         // only the letters MZ is rejected with "The parameter is incorrect".
         let exe = std::env::current_exe().expect("test executable");
         let program = crate::browse::shell_path(&exe.display().to_string());
-        let dir = std::env::temp_dir().join(format!("glass-fw-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let copy = dir.join("glass-copy.exe");
+        // The firewall service reads the image itself. A copy under the user temp
+        // directory is rejected with "The parameter is incorrect"; a sibling of this
+        // executable is a path it can already open.
+        let copy = exe.with_file_name(format!("glass-fw-{}-copy.exe", std::process::id()));
         std::fs::copy(&exe, &copy).expect("copy the test executable");
         let second = crate::browse::shell_path(&copy.display().to_string());
         struct Guard {
             programs: Vec<String>,
-            dir: std::path::PathBuf,
+            copy: std::path::PathBuf,
         }
         impl Drop for Guard {
             fn drop(&mut self) {
                 for program in &self.programs {
                     let _ = delete_glass_rules(program);
                 }
-                let _ = std::fs::remove_dir_all(&self.dir);
+                let _ = std::fs::remove_file(&self.copy);
             }
         }
-        let _guard = Guard { programs: vec![program.clone(), second.clone()], dir };
+        let _guard = Guard { programs: vec![program.clone(), second.clone()], copy };
         let _ = delete_glass_rules(&program);
         let _ = delete_glass_rules(&second);
 
@@ -1149,7 +1150,9 @@ mod tests {
         assert!(historical[0].grouping.is_empty(), "historical rules have no grouping");
 
         let mut store = ComStore;
-        store.add_allow(&second, AllowSpec::Any).expect("create the second wide rule");
+        store
+            .add_allow(&second, AllowSpec::Any)
+            .unwrap_or_else(|error| panic!("create the second wide rule for {second}: {error}"));
         firewall_scope::reconcile(&mut store, &[program.as_str(), second.as_str()], ScopePlan { scope: RemoteScope::Tailscale })
             .expect("tailscale reconcile");
         assert_exact_tailscale(&mut store, &program);

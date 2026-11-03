@@ -2,6 +2,12 @@
 
 What changed in each release of Glass. `glass update` (or the Glass app) installs the newest; every build is on [GitHub Releases](https://github.com/Ntarasiuk/glass/releases).
 
+## Unreleased
+
+### Windows
+
+- An MSI install's secure-desktop service installs a newer official release on its own (`msiexec /qn`), with no window and no permission prompt. It waits while someone is connected. The Updates policy turns this off.
+
 ## 0.13.1
 
 November 3, 2026

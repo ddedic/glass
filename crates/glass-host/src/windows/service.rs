@@ -1,6 +1,6 @@
 //! The optional secure-desktop service (`glass service install`). It runs as LocalSystem
-//! and does one thing: keep a SYSTEM helper (see `windows::secure`) running in the active
-//! console session, re-spawning it whenever that session changes or the helper exits. The
+//! and keeps a SYSTEM helper (see `windows::secure`) running in the active console
+//! session, re-spawning it whenever that session changes or the helper exits. The
 //! helper is what can see and drive the lock screen, UAC prompts and elevated windows; the
 //! per-user host stays exactly as it was and remains the only thing that serves and
 //! authenticates viewers.
@@ -10,8 +10,8 @@
 //! stops it the moment someone signs in.
 //!
 //! The service account is LocalSystem so it can duplicate its own token into the console
-//! session and call SendSAS; nothing else about Glass moves to SYSTEM. Install also sets
-//! the SoftwareSASGeneration policy so SendSAS (Ctrl+Alt+Del) is allowed.
+//! session, call SendSAS, and install an official MSI update without a prompt. Install also
+//! sets the SoftwareSASGeneration policy so SendSAS (Ctrl+Alt+Del) is allowed.
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 
@@ -478,6 +478,9 @@ fn keep_helper_alive(stop: HANDLE, wake: HANDLE, sas: HANDLE) {
     let mut signin: Option<HANDLE> = None;
     let mut signin_session = 0xFFFF_FFFFu32;
     loop {
+        // A quiet MSI update, when this copy was installed for everyone. It never runs on
+        // the thread that has to answer the service control manager.
+        super::auto_update::tick();
         // SAFETY: plain query.
         let session = unsafe { WTSGetActiveConsoleSessionId() };
         // Reap a helper that exited.

@@ -666,13 +666,13 @@ fn add_rule(program: &str, spec: AllowSpec) -> Result<(), String> {
     with_com(|| unsafe {
         let policy: INetFwPolicy2 = CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER).map_err(|error| error.to_string())?;
         let rule: INetFwRule2 = CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER).map_err(|error| error.to_string())?;
-        rule.SetName(&BSTR::from(RULE_NAME)).map_err(|error| error.to_string())?;
-        rule.SetApplicationName(&BSTR::from(program)).map_err(|error| error.to_string())?;
-        rule.SetEnabled(VARIANT_TRUE).map_err(|error| error.to_string())?;
-        rule.SetDirection(NET_FW_RULE_DIR_IN).map_err(|error| error.to_string())?;
-        rule.SetAction(NET_FW_ACTION_ALLOW).map_err(|error| error.to_string())?;
-        rule.SetProfiles(PROFILE_PRIVATE).map_err(|error| error.to_string())?;
-        rule.SetProtocol(NET_FW_IP_PROTOCOL_ANY.0).map_err(|error| error.to_string())?;
+        rule.SetName(&BSTR::from(RULE_NAME)).map_err(|error| format!("name: {error}"))?;
+        rule.SetApplicationName(&BSTR::from(program)).map_err(|error| format!("application: {error}"))?;
+        rule.SetEnabled(VARIANT_TRUE).map_err(|error| format!("enabled: {error}"))?;
+        rule.SetDirection(NET_FW_RULE_DIR_IN).map_err(|error| format!("direction: {error}"))?;
+        rule.SetAction(NET_FW_ACTION_ALLOW).map_err(|error| format!("action: {error}"))?;
+        rule.SetProfiles(PROFILE_PRIVATE).map_err(|error| format!("profiles: {error}"))?;
+        rule.SetProtocol(NET_FW_IP_PROTOCOL_ANY.0).map_err(|error| format!("protocol: {error}"))?;
         let remote = match spec {
             AllowSpec::Any => None,
             AllowSpec::TailscaleBoth => Some(format!("{TAILSCALE_V4},{TAILSCALE_V6}")),
@@ -680,12 +680,12 @@ fn add_rule(program: &str, spec: AllowSpec) -> Result<(), String> {
             AllowSpec::TailscaleV6 => Some(TAILSCALE_V6.to_string()),
         };
         if let Some(remote) = remote {
-            rule.SetRemoteAddresses(&BSTR::from(remote)).map_err(|error| error.to_string())?;
-            rule.SetEdgeTraversalOptions(NET_FW_EDGE_TRAVERSAL_TYPE_DENY.0).map_err(|error| error.to_string())?;
+            rule.SetRemoteAddresses(&BSTR::from(remote)).map_err(|error| format!("remote: {error}"))?;
+            rule.SetEdgeTraversalOptions(NET_FW_EDGE_TRAVERSAL_TYPE_DENY.0).map_err(|error| format!("edge: {error}"))?;
         }
-        let rules = policy.Rules().map_err(|error| error.to_string())?;
-        let as_rule: INetFwRule = rule.cast().map_err(|error| error.to_string())?;
-        rules.Add(&as_rule).map_err(|error| error.to_string())
+        let rules = policy.Rules().map_err(|error| format!("rules: {error}"))?;
+        let as_rule: INetFwRule = rule.cast().map_err(|error| format!("rule interface: {error}"))?;
+        rules.Add(&as_rule).map_err(|error| format!("add: {error}"))
     })
 }
 
@@ -785,9 +785,10 @@ mod tests {
             return;
         }
         assert!(service::is_elevated(), "GLASS_FIREWALL_INTEGRATION requires an elevated process");
-        let exe = std::env::temp_dir().join(format!("glass-fw-{}-test.exe", std::process::id()));
-        std::fs::write(&exe, b"MZ").unwrap();
-        let program = exe.display().to_string();
+        // The firewall service checks the image with GetBinaryType. A file that is
+        // only the letters MZ is rejected with "The parameter is incorrect".
+        let exe = std::env::current_exe().expect("test executable");
+        let program = crate::browse::shell_path(&exe.display().to_string());
         struct Guard(String);
         impl Drop for Guard {
             fn drop(&mut self) {

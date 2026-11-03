@@ -123,6 +123,12 @@ pub fn no_window(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
+/// Same as [`no_window`] for the async process API (`tailscale` status, serve, cert).
+pub fn no_window_tokio(cmd: &mut tokio::process::Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
 /// A PowerShell single-quoted string literal.
 pub fn ps_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))

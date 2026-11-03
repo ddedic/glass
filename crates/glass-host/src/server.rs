@@ -43,8 +43,7 @@ pub struct Shared {
     /// Failed sign-ins per address, for brute-force protection.
     pub auth_failures:
         Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
-    /// Tailnet login of this computer's owner; their devices skip the token.
-    /// Updated after startup. Empty means unknown, tagged, or signed out: a token is required.
+    /// Fresh `tailscale status` check. Each owner grant reads one snapshot.
     pub tailnet_owner: tailscale::TailnetOwner,
     pub audio: AudioPackets,
     pub rate: Mutex<crate::rate::RateControl>,
@@ -570,18 +569,45 @@ async fn control(
     {
         auth = Some(Auth::Token);
     }
-    if auth.is_none()
-        && hello_ok
-        // Over WebRTC the address is public, never a tailnet device's.
-        && ctx.relayed.is_none()
-        && let Some(login) = tailscale::identity(peer).await
-    {
-        if shared.tailnet_owner.resolve().await.as_deref() == Some(login.as_str()) {
-            auth = Some(Auth::Tailnet);
-        } else if let Some(scope) = tailnet_guest_scope(&login) {
-            // Someone else on the tailnet: the access rules name them, or the owner lets the
-            // whole tailnet in (tailnet-members).
-            auth = Some(Auth::TailnetGuest { login, scope });
+    // One status snapshot for this grant: Self's owner and this peer's UserID together.
+    // Over WebRTC the address is public, never a tailnet device's.
+    let mut tailnet_down = false;
+    let mut tailnet_name = None;
+    let mut posture_net = None;
+    if hello_ok && ctx.relayed.is_none() {
+        match shared.tailnet_owner.view(peer).await {
+            tailscale::View::Unavailable => {
+                if auth.is_none() {
+                    tailnet_down = true;
+                }
+            }
+            tailscale::View::Ready {
+                is_owner,
+                login,
+                name,
+                tags,
+                os,
+                ..
+            } => {
+                if login.is_some() || !tags.is_empty() || name.is_some() || os.is_some() {
+                    posture_net = Some(crate::posture::Tailnet {
+                        owner: is_owner,
+                        tags,
+                        os,
+                    });
+                    tailnet_name = name;
+                }
+                if auth.is_none() && is_owner {
+                    auth = Some(Auth::Tailnet);
+                } else if auth.is_none()
+                    && let Some(login) = login
+                    && let Some(scope) = tailnet_guest_scope(&login)
+                {
+                    // Someone else on the tailnet: the access rules name them, or the owner lets the
+                    // whole tailnet in (tailnet-members).
+                    auth = Some(Auth::TailnetGuest { login, scope });
+                }
+            }
         }
     }
     // A policy can turn guest links (or, in its own host, quick support) off: new links and
@@ -633,6 +659,14 @@ async fn control(
         }
     }
     let Some(auth) = auth else {
+        // Tailscale not answering is not a bad token: the page reconnects and gets in
+        // once status confirms the owner. A bad link still counts.
+        if sign_in(tailnet_down, link_failed) == SignIn::Retry {
+            info!("{peer}: tailscale status unavailable; reconnecting rather than asking for the token");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            ctx.conn.close(1u32.into(), b"tailscale unavailable");
+            return Ok(());
+        }
         record_auth_failure(shared, peer);
         warn!("{peer}: rejected (bad or missing token)");
         refused(&device, if link_failed { "used or expired link" } else { "no valid token" });
@@ -719,7 +753,7 @@ async fn control(
     let terminal = terminal && !signin;
     let guest = !perms.owner;
     if matches!(auth, Auth::Tailnet | Auth::TailnetGuest { .. })
-        && let Some(name) = tailscale::device_name(peer).await
+        && let Some(name) = tailnet_name
     {
         device = format!("{name} ({device})");
     }
@@ -744,7 +778,7 @@ async fn control(
     };
 
     // Device posture: what this computer requires of devices, checked before asking anyone.
-    if let Err(why) = crate::posture::check(peer, ctx.relayed.is_some(), ua.as_deref()).await {
+    if let Err(why) = crate::posture::check(peer, ctx.relayed.is_some(), ua.as_deref(), posture_net) {
         warn!("{peer}: refused by device posture: {why}");
         refused(&device, &format!("posture: {why}"));
         let msg = format!("Not allowed: {why}.");
@@ -1878,6 +1912,21 @@ const KEYFRAME_REQUEST_SPACING: Duration = Duration::from_millis(500);
 const QUIET_LIMIT: Duration = Duration::from_secs(15);
 const QUIET_CHECK: Duration = Duration::from_secs(3);
 
+/// A Tailscale blip is not a failed sign-in. The viewer retries. A bad link still is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignIn {
+    Retry,
+    Unauthorized,
+}
+
+fn sign_in(tailnet_down: bool, link_failed: bool) -> SignIn {
+    if tailnet_down && !link_failed {
+        SignIn::Retry
+    } else {
+        SignIn::Unauthorized
+    }
+}
+
 const AUTH_MAX_FAILURES: u32 = 10;
 const AUTH_WINDOW: Duration = Duration::from_secs(600);
 
@@ -2404,5 +2453,12 @@ mod tests {
         assert!(port > taken && port < taken.saturating_add(crate::PORT_TRIES), "{port}");
         assert_eq!(endpoints[0].local_addr().unwrap().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(endpoints[0].local_addr().unwrap().port(), port);
+    }
+
+    #[test]
+    fn a_tailscale_blip_is_not_a_bad_token() {
+        assert_eq!(sign_in(true, false), SignIn::Retry);
+        assert_eq!(sign_in(true, true), SignIn::Unauthorized, "a used link still rejects");
+        assert_eq!(sign_in(false, false), SignIn::Unauthorized, "a definite non-owner needs the token");
     }
 }

@@ -7,6 +7,7 @@
 //! - oldest browser version, from the browser's user agent;
 //! - passkeys with user verification (enforced in passkey.rs).
 
+#[cfg(test)]
 use serde_json::Value;
 
 /// OS names posture rules use.
@@ -138,7 +139,8 @@ pub fn browser_from_ua(ua: &str) -> Option<(&'static str, u32)> {
 }
 
 /// Facts about a tailnet peer from `tailscale whois` output.
-pub fn tailnet_facts(whois: &Value, owner: Option<&str>) -> Tailnet {
+#[cfg(test)]
+fn tailnet_facts(whois: &Value, owner: Option<&str>) -> Tailnet {
     Tailnet {
         owner: owner.is_some_and(|o| whois["UserProfile"]["LoginName"].as_str() == Some(o)),
         tags: whois["Node"]["Tags"]
@@ -154,22 +156,19 @@ pub fn tailnet_facts(whois: &Value, owner: Option<&str>) -> Tailnet {
 }
 
 /// Checks a connecting device against the current settings.
-pub async fn check(peer: std::net::IpAddr, relayed: bool, ua: Option<&str>) -> Result<(), String> {
+pub fn check(
+    _peer: std::net::IpAddr,
+    relayed: bool,
+    ua: Option<&str>,
+    tailnet: Option<Tailnet>,
+) -> Result<(), String> {
     let policy = Policy::from_settings(&crate::settings::load());
     if policy.is_empty() {
         return Ok(());
     }
-    // Over WebRTC the address is public, never a tailnet device's.
-    let tailnet = if relayed || crate::testmode::enabled() {
-        None
-    } else {
-        let who = crate::tailscale::whois(peer).await;
-        let owner = match crate::server::shared() {
-            Some(shared) => shared.tailnet_owner.resolve().await,
-            None => None,
-        };
-        who.map(|w| tailnet_facts(&w, owner.as_deref()))
-    };
+    // Over WebRTC the address is public, never a tailnet device's. `tailnet` is the
+    // same status snapshot the sign-in used.
+    let tailnet = if relayed || crate::testmode::enabled() { None } else { tailnet };
     evaluate(
         &policy,
         &Facts {
@@ -182,6 +181,7 @@ pub async fn check(peer: std::net::IpAddr, relayed: bool, ua: Option<&str>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     const SAFARI_IPAD: &str = "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
     const CHROME_WIN: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";

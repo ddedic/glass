@@ -87,15 +87,14 @@ pub(crate) async fn is_owner(peer: IpAddr, headers: &HeaderMap) -> bool {
     {
         return true;
     }
-    // Who the peer is, then whether this computer is theirs right now. Reading the
-    // owner first would keep the previous account for as long as whois takes.
+    // Same status snapshot as a new session: Self's UserID and this peer's, together.
     let Some(shared) = crate::server::shared() else {
         return false;
     };
-    let Some(login) = crate::tailscale::identity(peer).await else {
-        return false;
-    };
-    shared.tailnet_owner.resolve().await.as_deref() == Some(login.as_str())
+    matches!(
+        shared.tailnet_owner.view(peer).await,
+        crate::tailscale::View::Ready { is_owner: true, .. }
+    )
 }
 
 #[derive(serde::Deserialize)]

@@ -1315,7 +1315,7 @@ async fn run_host(args: Args) -> Result<()> {
             video,
             Box::new(testmode::FakeInput),
             Arc::new(testmode::FakeClipboard),
-            // Who owns the computer on Tailscale, when a test says (see tailscale::identity).
+            // Who owns the computer on Tailscale, when a test says (GLASS_TEST_TAILNET_OWNER).
             tailscale::TailnetOwner::fixed(std::env::var("GLASS_TEST_TAILNET_OWNER").ok()),
             None,
         )
@@ -1370,8 +1370,8 @@ async fn run_host(args: Args) -> Result<()> {
             clipboard::watch(events.clone());
         }
         // Tailscale often isn't up yet (Windows, right after sign-in, or this sign-in host
-        // starting before tailscaled). The owner is filled in afterwards and re-checked, so a
-        // re-login or a tag takes effect without restarting. Unknown still means a token.
+        // starting before tailscaled). Later connections read status again, so a re-login or
+        // a tag takes effect without restarting. A blip reconnects; a tagged node needs a token.
         let tailnet_owner = tailscale::TailnetOwner::unknown();
         tailnet_owner.watch();
         (

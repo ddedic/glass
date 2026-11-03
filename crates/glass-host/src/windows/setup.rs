@@ -56,24 +56,23 @@ fn service_step() -> Result<()> {
 fn firewall_step() -> Result<()> {
     log::step("Windows Defender Firewall")?;
     let views = firewall::inspect();
-    let wanted = firewall::scope();
+    let wanted = views.first().map(|view| view.scope).unwrap_or(RemoteScope::Any);
     if views.is_empty() || views.iter().all(|view| view.state == State::Unreadable) {
         log::warning("Couldn't read the firewall's rules; Windows may ask about Glass when it starts.")?;
         return Ok(());
     }
     if views.iter().all(|view| view.state == State::Ready) {
         log::success(firewall::ready_sentence(wanted))?;
+        if views.iter().any(|view| view.blocked) {
+            log::warning(firewall::blocked_hint())?;
+        }
         if views.iter().any(|view| view.foreign_wider) {
             log::warning(firewall::foreign_warning(wanted))?;
         }
         return Ok(());
     }
-    if views.iter().all(|view| view.state == State::Blocked) {
-        log::warning(firewall::blocked_hint())?;
-        return Ok(());
-    }
     if !views.iter().any(|view| view.state == State::NeedsChange) {
-        if views.iter().any(|view| view.state == State::Blocked) {
+        if views.iter().any(|view| view.blocked) {
             log::warning(firewall::blocked_hint())?;
         }
         if views.iter().any(|view| view.state == State::Unreadable) {
@@ -113,22 +112,23 @@ fn firewall_step() -> Result<()> {
         return Ok(());
     }
     let after = firewall::elevate_sync();
+    let wanted = after.first().map(|view| view.scope).unwrap_or(wanted);
     let pending: Vec<_> = after.iter().filter(|view| matches!(view.state, State::NeedsChange | State::Unreadable)).collect();
-    let blocked = after.iter().any(|view| view.state == State::Blocked);
-    if pending.is_empty() && !blocked {
+    let blocked = after.iter().any(|view| view.blocked);
+    if pending.is_empty() {
         log::success(firewall::ready_sentence(wanted))?;
     } else {
         for view in &pending {
             let detail = if view.detail.is_empty() {
-                format!("the firewall rule wasn't updated.\n{}", firewall::manual_command(&view.path, wanted))
+                format!("the firewall rule wasn't updated.\n{}", firewall::manual_command(&view.path, wanted, view.has_glass_allow))
             } else {
                 view.detail.clone()
             };
             log::warning(format!("{}: {detail}", view.path.display()))?;
         }
-        if blocked {
-            log::warning(firewall::blocked_hint())?;
-        }
+    }
+    if blocked {
+        log::warning(firewall::blocked_hint())?;
     }
     if after.iter().any(|view| view.foreign_wider) {
         log::warning(firewall::foreign_warning(wanted))?;
@@ -141,7 +141,7 @@ fn firewall_step() -> Result<()> {
 pub fn prepare_unattended() -> Vec<crate::setup::Need> {
     let mut needs = Vec::new();
     let views = if super::service::is_elevated() { firewall::sync() } else { firewall::inspect() };
-    let wanted = firewall::scope();
+    let wanted = views.first().map(|view| view.scope).unwrap_or(RemoteScope::Any);
     if views.iter().any(|view| view.state == State::NeedsChange) {
         let commands = views
             .iter()
@@ -161,7 +161,7 @@ pub fn prepare_unattended() -> Vec<crate::setup::Need> {
             ),
         };
         needs.push(crate::setup::Need { step: "firewall", action, on_screen: false });
-    } else if views.iter().any(|view| view.state == State::Blocked) {
+    } else if views.iter().any(|view| view.blocked) {
         needs.push(crate::setup::Need {
             step: "firewall",
             action: "Windows Defender Firewall blocks Glass: in Windows Security › Firewall & network protection › Allow an app through firewall, tick Private for Glass".into(),
@@ -181,12 +181,11 @@ pub fn prepare_unattended() -> Vec<crate::setup::Need> {
 /// Commands to print for one program. A fresh default install only needs the add;
 /// replacing a rule Glass already created needs the delete as well.
 fn manual_lines(view: &firewall::ProgramView, scope: RemoteScope) -> String {
-    let command = if scope == RemoteScope::Any && !view.has_glass_allow {
-        format!("netsh {}", firewall::add_rule_args(&view.path, scope))
-    } else {
-        firewall::manual_command(&view.path, scope)
-    };
-    command.lines().map(|line| format!("  {line}")).collect::<Vec<_>>().join("\n")
+    firewall::manual_command(&view.path, scope, view.has_glass_allow)
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub const TAILSCALE_INSTALL: &str = "Install Tailscale: winget install Tailscale.Tailscale (or https://tailscale.com/download/windows),\n\

@@ -32,6 +32,10 @@ jobs:
           shared-key: ci-${{ runner.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --profile ci
+        env:
+          # Windows runners are administrators. The firewall integration test is a no-op
+          # unless this is 1, so a developer running the same suite does not need elevation.
+          GLASS_FIREWALL_INTEGRATION: ${{ runner.os == 'Windows' && '1' || '0' }}
       - run: cargo build --profile ci -p glass-host
       # The optional VA-API encoder (GLASS_ENCODER=vaapi) builds and its unit tests pass
       # (the GPU test is ignored: runners have no VA device).

@@ -5,17 +5,15 @@
   Built by scripts/package.ps1 with WiX Toolset 5 (wix build -arch x64|arm64 -d Version=…
   -d Stage=… -d Icon=…). Installs to Program Files\Glass with the zip's layout, starts glassw
   for each user who signs in (the HKLM Run key), adds the Start menu shortcut, puts glass on
-  the PATH and lets Glass through Windows Defender Firewall on private networks
-  (any remote address, matching the default `glass config bind`). A tailscale bind is
-  applied later by `glass setup` or `glass service install`: a major upgrade installs
-  this wide exception again, so that command has to be run afterwards. The host finds
-  this copy through HKLM\SOFTWARE\Glass InstallDir
+  the PATH. It does not add a firewall exception itself: a wide exception would come
+  back on every upgrade. After the files are in place, glass.exe --glass-firewall-sync
+  (as SYSTEM) writes the rule that matches the narrowest saved bind it can read.
+  The host finds this copy through HKLM\SOFTWARE\Glass InstallDir
   (src/windows/agent.rs). Settings stay in each user's profile and survive uninstalling.
 
   The UpgradeCode never changes: each new MSI replaces the one before (MajorUpgrade).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package Name="Glass" Manufacturer="Glass" Version="$(var.Version)"
            UpgradeCode="83EBD5C2-954D-4113-A3C1-4797653E5386" Scope="perMachine" Compressed="yes">
@@ -37,12 +35,7 @@
       <Directory Id="INSTALLFOLDER" Name="Glass">
         <Directory Id="BinFolder" Name="bin">
           <Component Id="GlassExe">
-            <File Id="GlassExe" Source="$(var.Stage)\bin\glass.exe" KeyPath="yes">
-              <!-- Default bind: private profile, any remote address, no port. `glass setup`
-                   replaces it when bind is tailscale. Keep this shape or setup will
-                   rewrite the rule on every run for the default bind. -->
-              <fw:FirewallException Id="GlassFirewall" Name="Glass" Profile="private" Scope="any" IgnoreFailure="yes" />
-            </File>
+            <File Id="GlassExe" Source="$(var.Stage)\bin\glass.exe" KeyPath="yes" />
             <Environment Id="GlassPath" Name="PATH" Value="[BinFolder]" Part="last" Action="set" System="yes" />
           </Component>
           <Component Id="GlasswExe">
@@ -82,12 +75,16 @@
 
     <!-- Installed by hand (with its window): open the app, as the person who ran it, to set
          Glass up. A silent install (/qn) leaves that to sign-in. -->
+    <!-- The firewall rule follows the saved bind. Return is ignore: failing the install
+         would roll back to the previous MSI, and that package installs a wide exception. -->
+    <CustomAction Id="SyncFirewall" FileRef="GlassExe" ExeCommand="--glass-firewall-sync" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="OpenGlass" Directory="BinFolder" ExeCommand="&quot;[#GlasswExe]&quot; app" Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
     <!-- Uninstalled for good (not upgraded): the optional secure-desktop service runs this
          copy's glass.exe, so it goes too. An upgrade keeps it: the installer closes it with
          the other copies of glass.exe, and Windows starts it again on the new one. -->
     <CustomAction Id="RemoveSecureDesktop" FileRef="GlassExe" ExeCommand="service uninstall" Execute="deferred" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
+      <Custom Action="SyncFirewall" After="InstallFiles" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="OpenGlass" After="InstallFinalize" Condition="UILevel &gt;= 5 AND NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="RemoveSecureDesktop" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>

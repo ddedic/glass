@@ -26,6 +26,11 @@ fn prefix() -> PathBuf {
     super::local_app_data().join("Programs").join("Glass")
 }
 
+/// The per-user host (`%LOCALAPPDATA%\Programs\Glass\bin\glass.exe`). It may not exist.
+pub fn host_exe() -> PathBuf {
+    prefix().join("bin").join("glass.exe")
+}
+
 fn state() -> PathBuf {
     super::local_app_data().join("Glass")
 }

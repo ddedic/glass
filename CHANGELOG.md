@@ -4,7 +4,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 
 ## Unreleased
 
-- On Windows, the inbound firewall rule Glass creates follows `glass config bind`. `tailscale` (or a Tailscale address) allows only `100.64.0.0/10` and `fd7a:115c:a1e0::/48` and blocks edge traversal. The default listen address is unchanged: private networks, any remote address. `glass setup` or `glass service install` applies it. A one-off `--bind` does not.
+- On Windows, the inbound firewall rule Glass creates follows `glass config bind`. `tailscale` (or a Tailscale address) allows only `100.64.0.0/10` and `fd7a:115c:a1e0::/48` and blocks edge traversal. The default listen address is unchanged: private networks, any remote address. `glass setup`, `glass service install`, and the MSI apply it, including on upgrade. If the narrower rule cannot be created, the wider Glass allow is still removed. A one-off `--bind` does not change the rule.
 
 ## 0.13.0
 

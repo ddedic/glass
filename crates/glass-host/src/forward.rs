@@ -87,15 +87,15 @@ pub(crate) async fn is_owner(peer: IpAddr, headers: &HeaderMap) -> bool {
     {
         return true;
     }
-    // The owner's own devices only: forwarded ports aren't for guests. Unknown or tagged
-    // is not an owner, so those connections need the token like any other client.
+    // Who the peer is, then whether this computer is theirs right now. Reading the
+    // owner first would keep the previous account for as long as whois takes.
     let Some(shared) = crate::server::shared() else {
         return false;
     };
-    let Some(owner) = shared.tailnet_owner.resolve().await else {
+    let Some(login) = crate::tailscale::identity(peer).await else {
         return false;
     };
-    crate::tailscale::identity(peer).await.is_some_and(|login| login == owner)
+    shared.tailnet_owner.resolve().await.as_deref() == Some(login.as_str())
 }
 
 #[derive(serde::Deserialize)]

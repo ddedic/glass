@@ -6,7 +6,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 
 ### Tailscale not ready yet
 
-- Your own tailnet devices connect without a token even when Tailscale isn't ready at the moment Glass starts (common right after signing in to Windows, or when the sign-in screen's Glass starts first). Glass keeps checking, and follows a later sign-in as someone else. A tagged device still asks for the token.
+- Your own tailnet devices connect without a token even when Tailscale isn't ready at the moment Glass starts (common right after signing in to Windows, or when the sign-in screen's Glass starts first). Glass keeps checking, and follows a later sign-in as someone else. If Tailscale doesn't answer, every client still needs the token. A tagged device does too.
 
 ## 0.13.0
 

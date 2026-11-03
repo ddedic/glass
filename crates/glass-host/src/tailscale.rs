@@ -1,22 +1,29 @@
 //! Trusts peers that Tailscale says belong to the same user as this Mac, so devices on
 //! your own tailnet connect without a token.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
+use tokio::sync::{Notify, Semaphore};
 
-/// How long to wait between checks once Tailscale has given a definite answer.
+/// Background recheck once Tailscale has answered, and the cap on startup backoff.
 const RECHECK: Duration = Duration::from_secs(30);
-/// A connection-time lookup gives up quickly, so a flood of sign-ins can't stall on the CLI.
-const LAZY_TIMEOUT: Duration = Duration::from_secs(1);
-/// At most one of those lookups per interval, however many connections arrive.
-const LAZY_GAP: Duration = Duration::from_secs(1);
-/// The background check can wait longer; a hung CLI must not stall the loop forever.
-const POLL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How recent a `tailscale status` must be before it can skip the token.
+const FRESH: Duration = Duration::from_secs(2);
+/// Bound on `tailscale status` and `whois`. The child is killed when this fires.
+const CLI_TIMEOUT: Duration = Duration::from_secs(2);
+/// Concurrent peer lookups. A sign-in flood shares these instead of spawning one each.
+const WHOIS_LIMIT: usize = 4;
+
+/// Bumped when the owner answer changes, so a whois cached for the previous account is dropped.
+static OWNER_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// `tailscale` on PATH, or the CLI inside the Mac App Store / standalone app bundle.
 pub(crate) fn cli() -> &'static str {
@@ -35,9 +42,46 @@ pub(crate) fn cli() -> &'static str {
     })
 }
 
+fn spawn(program: &str, args: &[&str]) -> Result<tokio::process::Child> {
+    Ok(tokio::process::Command::new(program)
+        .args(args)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?)
+}
+
+/// Runs `child` to completion. On timeout the process is killed and waited on, so it
+/// cannot outlive the call. `kill_on_drop` covers the future being cancelled first.
+async fn finish(mut child: tokio::process::Child, limit: Duration) -> Result<Vec<u8>> {
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let run = async {
+        tokio::try_join!(
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err),
+            child.wait(),
+        )
+    };
+    match tokio::time::timeout(limit, run).await {
+        Ok(Ok((_, _, status))) if status.success() => Ok(out),
+        Ok(Ok((_, _, _))) => anyhow::bail!("{}", String::from_utf8_lossy(&err).trim()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            anyhow::bail!("timed out")
+        }
+    }
+}
+
 async fn json(args: &[&str]) -> Result<Value> {
     let out = tokio::process::Command::new(cli())
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await?;
     anyhow::ensure!(
@@ -47,6 +91,12 @@ async fn json(args: &[&str]) -> Result<Value> {
         String::from_utf8_lossy(&out.stderr)
     );
     Ok(serde_json::from_slice(&out.stdout)?)
+}
+
+async fn json_within(args: &[&str], limit: Duration) -> Result<Value> {
+    Ok(serde_json::from_slice(
+        &finish(spawn(cli(), args)?, limit).await?,
+    )?)
 }
 
 /// This machine's Tailscale addresses (`100.x.x.x` and the tailnet IPv6), for `--bind tailscale`.
@@ -90,7 +140,7 @@ enum NodeOwner {
     User(String),
     /// Tagged, signed out, or the synthetic tagged-devices user. Not an owner.
     Nobody,
-    /// The local API didn't answer. Not a change of who owns the node.
+    /// No usable answer: still starting, timed out, or the CLI failed.
     Unavailable(String),
 }
 
@@ -125,17 +175,10 @@ fn owner_from_status(status: &Value) -> NodeOwner {
     }
 }
 
-async fn read_node_owner() -> NodeOwner {
-    match json(&["status", "--json"]).await {
+async fn read_node_owner_within(limit: Duration) -> NodeOwner {
+    match json_within(&["status", "--json"], limit).await {
         Ok(status) => owner_from_status(&status),
         Err(e) => NodeOwner::Unavailable(format!("{e:#}")),
-    }
-}
-
-async fn read_node_owner_within(limit: Duration) -> NodeOwner {
-    match tokio::time::timeout(limit, read_node_owner()).await {
-        Ok(found) => found,
-        Err(_) => NodeOwner::Unavailable("timed out".into()),
     }
 }
 
@@ -144,188 +187,262 @@ fn backoff(misses: u32) -> Duration {
     Duration::from_secs((1u64 << misses.min(5)).min(RECHECK.as_secs()))
 }
 
-/// What one refresh decided: how long to wait, and whether to say so in the log.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Refresh {
+/// One owner snapshot and the refresh that produces the next one.
+struct Snap {
+    generation: u64,
+    login: Option<String>,
+    at: Instant,
+    misses: u32,
+    announced: Option<String>,
+    logged_down: bool,
+    signed_out: bool,
+    refreshing: bool,
+    fixed: bool,
     wait: Duration,
-    /// Login announced the first time it becomes the owner. Repeating it is silent.
-    announce: Option<String>,
-    /// The first time Tailscale doesn't answer while the owner is still unknown.
-    unavailable: bool,
 }
 
-#[derive(Clone)]
-enum OwnerState {
-    /// Not yet a definite answer. Token required; keep asking.
-    Unknown,
-    User(String),
-    /// Tagged or signed out. Token required, and it is not "still starting".
-    Nobody,
+struct Inner {
+    state: Mutex<Snap>,
+    wake: Notify,
 }
 
-struct OwnerInner {
-    state: RwLock<OwnerState>,
-    misses: Mutex<u32>,
-    /// Last login we logged, so a retry or a blip doesn't log it again.
-    announced: Mutex<Option<String>>,
-    logged_unavailable: AtomicBool,
-    last_lazy: Mutex<Option<Instant>>,
-    /// One `tailscale status` at a time, shared by the background loop and connections.
-    in_flight: AtomicBool,
-}
+/// Clears `refreshing` when the in-flight status read finishes, including on cancel.
+struct Lead(Arc<Inner>);
 
-/// Clears [`OwnerInner::in_flight`] when the lookup finishes, including on cancel.
-struct Claim<'a> {
-    flag: &'a AtomicBool,
-}
-
-impl Drop for Claim<'_> {
+impl Drop for Lead {
     fn drop(&mut self) {
-        self.flag.store(false, Ordering::Release);
+        self.0.state.lock().unwrap().refreshing = false;
+        self.0.wake.notify_waiters();
     }
 }
 
-/// This computer's tailnet owner, resolved after startup and refreshed.
+enum Decide {
+    Answer(Option<String>),
+    /// `at` of the snapshot that was already too old to grant. A login counts only if a
+    /// read lands after this instant.
+    Wait(Instant),
+    Lead(Lead),
+}
+
+struct Outcome {
+    wait: Duration,
+    // Read by tests. Production only uses them to decide whether to log.
+    #[cfg_attr(not(test), allow(dead_code))]
+    logged_owner: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    logged_down: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    logged_out: bool,
+}
+
+fn blank() -> Snap {
+    Snap {
+        generation: 0,
+        login: None,
+        at: Instant::now(),
+        misses: 0,
+        announced: None,
+        logged_down: false,
+        signed_out: false,
+        refreshing: false,
+        fixed: false,
+        wait: Duration::ZERO,
+    }
+}
+
+/// This computer's tailnet owner, refreshed after startup.
 ///
-/// `get` is always the latest answer. `None` means unknown, tagged, or signed out: every
-/// client needs a token, the same as when Tailscale was down at startup. Readers must use
-/// this value, not a copy taken when the process started.
+/// `resolve` returns a login only from a current `tailscale status` (just read, or a
+/// couple of seconds old). Unknown, tagged, signed out, still starting, or a failed
+/// read returns `None`: the client needs a token. A failed read forgets the previous
+/// owner instead of keeping them.
 #[derive(Clone)]
 pub struct TailnetOwner {
-    inner: Arc<OwnerInner>,
+    inner: Arc<Inner>,
 }
 
 impl TailnetOwner {
-    fn new(state: OwnerState) -> Self {
+    fn from_snap(snap: Snap) -> Self {
         Self {
-            inner: Arc::new(OwnerInner {
-                state: RwLock::new(state),
-                misses: Mutex::new(0),
-                announced: Mutex::new(None),
-                logged_unavailable: AtomicBool::new(false),
-                last_lazy: Mutex::new(None),
-                in_flight: AtomicBool::new(false),
+            inner: Arc::new(Inner {
+                state: Mutex::new(snap),
+                wake: Notify::new(),
             }),
         }
     }
 
-    /// Claims the single in-flight lookup, or `None` when one is already running.
-    fn claim(&self) -> Option<Claim<'_>> {
-        self.inner
-            .in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Claim {
-                flag: &self.inner.in_flight,
-            })
-    }
-
     /// No answer yet. The background loop and connection attempts fill it in.
     pub fn unknown() -> Self {
-        Self::new(OwnerState::Unknown)
+        Self::from_snap(blank())
     }
 
     /// A fixed owner for `--test` (`GLASS_TEST_TAILNET_OWNER`). Never refreshed.
     pub fn fixed(login: Option<String>) -> Self {
-        let state = match login {
-            Some(login) => OwnerState::User(login),
-            None => OwnerState::Nobody,
-        };
-        Self::new(state)
+        let mut snap = blank();
+        snap.fixed = true;
+        snap.login = login;
+        Self::from_snap(snap)
     }
 
-    /// The login whose devices skip the token, or `None` when a token is required.
-    pub fn get(&self) -> Option<String> {
-        match &*self.inner.state.read().unwrap() {
-            OwnerState::User(login) => Some(login.clone()),
-            _ => None,
+    /// Last accepted login. Cleared when status fails, the node is tagged, or it signs out.
+    #[cfg(test)]
+    fn get(&self) -> Option<String> {
+        self.inner.state.lock().unwrap().login.clone()
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> u64 {
+        self.inner.state.lock().unwrap().generation
+    }
+
+    fn decide(&self, now: Instant) -> Decide {
+        let mut s = self.inner.state.lock().unwrap();
+        if s.fixed {
+            return Decide::Answer(s.login.clone());
         }
+        if s.login.is_some() && now.saturating_duration_since(s.at) < FRESH {
+            return Decide::Answer(s.login.clone());
+        }
+        if s.refreshing {
+            return Decide::Wait(s.at);
+        }
+        // A recent failure or a definite "no owner" is not asked again until its backoff
+        // elapses, and it does not grant the previous login.
+        if s.login.is_none() && now.saturating_duration_since(s.at) < s.wait {
+            return Decide::Answer(None);
+        }
+        s.refreshing = true;
+        Decide::Lead(Lead(Arc::clone(&self.inner)))
     }
 
-    fn is_unknown(&self) -> bool {
-        matches!(&*self.inner.state.read().unwrap(), OwnerState::Unknown)
-    }
-
-    /// Applies one answer. `Unavailable` keeps the last definite owner: while the daemon
-    /// is down, `whois` fails too, so that owner admits nobody. A tagged or signed-out
-    /// node clears it. Unknown stays unknown, which means a token is required.
-    fn commit(&self, observed: NodeOwner) -> Refresh {
-        match observed {
-            NodeOwner::User(login) => {
-                let announce = {
-                    let mut state = self.inner.state.write().unwrap();
-                    let same = matches!(&*state, OwnerState::User(have) if have == &login);
-                    *state = OwnerState::User(login.clone());
-                    drop(state);
-                    *self.inner.misses.lock().unwrap() = 0;
-                    if same {
-                        None
-                    } else {
-                        let mut announced = self.inner.announced.lock().unwrap();
-                        if announced.as_deref() == Some(login.as_str()) {
-                            None
-                        } else {
-                            *announced = Some(login.clone());
-                            Some(login)
+    fn commit(&self, observed: NodeOwner, now: Instant) -> Outcome {
+        let mut logged_owner = None;
+        let mut logged_down = None;
+        let mut logged_out = false;
+        let wait = {
+            let mut s = self.inner.state.lock().unwrap();
+            s.at = now;
+            match observed {
+                NodeOwner::User(login) => {
+                    if s.login.as_deref() != Some(login.as_str()) {
+                        s.generation = s.generation.saturating_add(1);
+                        OWNER_GEN.store(s.generation, Ordering::Release);
+                        s.login = Some(login.clone());
+                        if s.announced.as_deref() != Some(login.as_str()) {
+                            s.announced = Some(login.clone());
+                            logged_owner = Some(login);
                         }
                     }
-                };
-                if let Some(login) = &announce {
-                    tracing::info!("tailnet devices owned by {login} now connect without a token");
+                    s.misses = 0;
+                    s.logged_down = false;
+                    s.signed_out = false;
+                    s.wait = RECHECK;
                 }
-                Refresh {
-                    wait: RECHECK,
-                    announce,
-                    unavailable: false,
+                NodeOwner::Nobody => {
+                    if s.login.take().is_some() {
+                        s.generation = s.generation.saturating_add(1);
+                        OWNER_GEN.store(s.generation, Ordering::Release);
+                    }
+                    if !s.signed_out {
+                        s.signed_out = true;
+                        logged_out = true;
+                    }
+                    s.misses = 0;
+                    s.logged_down = false;
+                    s.wait = RECHECK;
                 }
-            }
-            NodeOwner::Nobody => {
-                let changed = {
-                    let mut state = self.inner.state.write().unwrap();
-                    let changed = !matches!(&*state, OwnerState::Nobody);
-                    *state = OwnerState::Nobody;
-                    changed
-                };
-                *self.inner.misses.lock().unwrap() = 0;
-                if changed {
-                    tracing::info!(
-                        "this computer is tagged or signed out of Tailscale; token required \
-                         for all clients"
-                    );
-                }
-                Refresh {
-                    wait: RECHECK,
-                    announce: None,
-                    unavailable: false,
-                }
-            }
-            NodeOwner::Unavailable(reason) => {
-                let log = self.is_unknown()
-                    && !self.inner.logged_unavailable.swap(true, Ordering::Relaxed);
-                if log {
-                    tracing::info!(
-                        "tailscale unavailable ({reason}); token required for all clients"
-                    );
-                }
-                let mut misses = self.inner.misses.lock().unwrap();
-                let wait = backoff(*misses);
-                *misses = misses.saturating_add(1);
-                Refresh {
-                    wait,
-                    announce: None,
-                    unavailable: log,
+                NodeOwner::Unavailable(reason) => {
+                    if s.login.take().is_some() {
+                        s.generation = s.generation.saturating_add(1);
+                        OWNER_GEN.store(s.generation, Ordering::Release);
+                    }
+                    s.signed_out = false;
+                    if !s.logged_down {
+                        s.logged_down = true;
+                        logged_down = Some(reason);
+                    }
+                    s.wait = backoff(s.misses);
+                    s.misses = s.misses.saturating_add(1);
                 }
             }
+            s.wait
+        };
+        if let Some(login) = &logged_owner {
+            tracing::info!("tailnet devices owned by {login} now connect without a token");
+        }
+        if logged_out {
+            tracing::info!(
+                "this computer is tagged or signed out of Tailscale; token required for all clients"
+            );
+        }
+        if let Some(reason) = &logged_down {
+            tracing::info!("tailscale unavailable ({reason}); token required for all clients");
+        }
+        Outcome {
+            wait,
+            logged_owner: logged_owner.is_some(),
+            logged_down: logged_down.is_some(),
+            logged_out,
         }
     }
 
-    /// One injected `self_login`, for the refresh loop and its tests.
-    async fn refresh_with<F, Fut>(&self, query: F) -> Refresh
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = NodeOwner>,
-    {
-        self.commit(query().await)
+    fn fresh_login(&self, now: Instant) -> Option<String> {
+        let s = self.inner.state.lock().unwrap();
+        if s.fixed || now.saturating_duration_since(s.at) < FRESH {
+            s.login.clone()
+        } else {
+            None
+        }
+    }
+
+    /// A waiter missed the snapshot it was born with. Grant only a read that completed
+    /// while it waited, and only while that read is still current.
+    fn grant_after_wait(&self, now: Instant, seen: Instant) -> Option<String> {
+        let s = self.inner.state.lock().unwrap();
+        if s.fixed {
+            return s.login.clone();
+        }
+        if s.at != seen && now.saturating_duration_since(s.at) < FRESH {
+            s.login.clone()
+        } else {
+            None
+        }
+    }
+
+    async fn wait_refresh(&self) {
+        let notified = self.inner.wake.notified();
+        tokio::pin!(notified);
+        if self.inner.state.lock().unwrap().refreshing {
+            let _ = tokio::time::timeout(CLI_TIMEOUT, notified).await;
+        }
+    }
+
+    fn force_lead(&self) -> Option<Lead> {
+        let mut s = self.inner.state.lock().unwrap();
+        if s.refreshing {
+            return None;
+        }
+        s.refreshing = true;
+        Some(Lead(Arc::clone(&self.inner)))
+    }
+
+    async fn tick(&self) -> Duration {
+        if self.inner.state.lock().unwrap().fixed {
+            return RECHECK;
+        }
+        let Some(lead) = self.force_lead() else {
+            self.wait_refresh().await;
+            return self
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .wait
+                .max(Duration::from_millis(200));
+        };
+        let outcome = self.commit(read_node_owner_within(CLI_TIMEOUT).await, Instant::now());
+        drop(lead);
+        outcome.wait
     }
 
     /// Asks again until Tailscale answers, then keeps checking so a re-login or a tag lands.
@@ -333,52 +450,35 @@ impl TailnetOwner {
         let owner = self.clone();
         tokio::spawn(async move {
             loop {
-                let wait = if let Some(_claim) = owner.claim() {
-                    owner
-                        .refresh_with(|| read_node_owner_within(POLL_TIMEOUT))
-                        .await
-                        .wait
-                } else {
-                    // A connection is already asking. Don't start a second status call.
-                    Duration::from_millis(200)
-                };
+                let wait = owner.tick().await;
                 tokio::time::sleep(wait).await;
             }
         });
     }
 
-    /// The current owner. While it's still unknown, asks once (short timeout, and at most
-    /// one lookup per [`LAZY_GAP`], shared with the background loop).
+    /// The owner to authorize right now. A stale, missing, or in-flight answer is `None`.
     pub async fn resolve(&self) -> Option<String> {
-        self.resolve_with(Instant::now(), LAZY_GAP, || {
-            read_node_owner_within(LAZY_TIMEOUT)
-        })
-        .await
+        self.resolve_with(Instant::now(), || read_node_owner_within(CLI_TIMEOUT))
+            .await
     }
 
-    async fn resolve_with<F, Fut>(&self, now: Instant, gap: Duration, query: F) -> Option<String>
+    async fn resolve_with<F, Fut>(&self, now: Instant, query: F) -> Option<String>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = NodeOwner>,
+        Fut: Future<Output = NodeOwner>,
     {
-        // A known user, or a node we already know is tagged or signed out.
-        if !self.is_unknown() {
-            return self.get();
-        }
-        // Someone is already asking. Don't start another, and don't guess an owner.
-        let Some(_claim) = self.claim() else {
-            return self.get();
-        };
-        {
-            let mut last = self.inner.last_lazy.lock().unwrap();
-            if last.is_some_and(|t| now.saturating_duration_since(t) < gap) {
-                return None;
+        let lead = match self.decide(now) {
+            Decide::Answer(login) => return login,
+            Decide::Wait(seen) => {
+                self.wait_refresh().await;
+                return self.grant_after_wait(now, seen);
             }
-            *last = Some(now);
-        }
-        let observed = query().await;
-        self.commit(observed);
-        self.get()
+            Decide::Lead(lead) => lead,
+        };
+        self.commit(query().await, now);
+        let login = self.fresh_login(now);
+        drop(lead);
+        login
     }
 }
 
@@ -396,6 +496,7 @@ pub async fn serve_https_to(port: u16) -> Result<()> {
     let target = format!("https+insecure://localhost:{port}");
     let out = tokio::process::Command::new(cli())
         .args(["serve", "--bg", &target])
+        .kill_on_drop(true)
         .output()
         .await?;
     anyhow::ensure!(
@@ -465,12 +566,8 @@ pub enum Probe {
     NotRunning,
     LoggedOut,
     /// Connected, but the tailnet hasn't enabled HTTPS certificates.
-    NoHttps {
-        name: String,
-    },
-    Ready {
-        name: String,
-    },
+    NoHttps { name: String },
+    Ready { name: String },
 }
 
 /// Where this Mac stands with Tailscale, for `glass setup`.
@@ -508,9 +605,7 @@ pub async fn probe() -> Probe {
 
 /// Gets (or renews) a Let's Encrypt cert for this Mac's tailnet name via `tailscale cert`.
 /// Returns None when Tailscale isn't running or the tailnet hasn't enabled HTTPS.
-pub async fn ensure_cert(
-    dir: &std::path::Path,
-) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+pub async fn ensure_cert(dir: &std::path::Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let status = json(&["status", "--json"]).await.ok()?;
     let name = status["CertDomains"]
         .as_array()?
@@ -521,6 +616,7 @@ pub async fn ensure_cert(
     let cert = dir.join(format!("{name}.crt"));
     let key = dir.join(format!("{name}.key"));
     // `tailscale cert` only contacts Let's Encrypt when the cert is missing or near expiry.
+    // No short timeout here: issuance can be slow. Dropping the future still kills the child.
     let out = tokio::process::Command::new(cli())
         .arg("cert")
         .arg("--cert-file")
@@ -528,6 +624,7 @@ pub async fn ensure_cert(
         .arg("--key-file")
         .arg(&key)
         .arg(&name)
+        .kill_on_drop(true)
         .output()
         .await
         .ok()?;
@@ -551,6 +648,166 @@ fn is_tailscale_ip(ip: IpAddr) -> bool {
     }
 }
 
+struct Flight {
+    generation: u64,
+    /// `None` while the lookup is running, then the CLI result (`None` on failure).
+    slot: Mutex<Option<Option<Value>>>,
+    wake: Notify,
+}
+
+impl Flight {
+    fn finish(&self, value: Option<Value>) {
+        *self.slot.lock().unwrap() = Some(value);
+        self.wake.notify_waiters();
+    }
+
+    async fn wait(&self, limit: Duration) -> Option<Value> {
+        let notified = self.wake.notified();
+        tokio::pin!(notified);
+        if let Some(value) = self.slot.lock().unwrap().clone() {
+            return value;
+        }
+        let _ = tokio::time::timeout(limit, notified).await;
+        self.slot.lock().unwrap().clone().flatten()
+    }
+}
+
+struct WhoisInner {
+    cache: HashMap<IpAddr, (u64, Instant, Value)>,
+    busy: HashMap<IpAddr, Arc<Flight>>,
+}
+
+struct WhoisGate {
+    permits: Arc<Semaphore>,
+    limit: Duration,
+    inner: Mutex<WhoisInner>,
+    err_at: Mutex<Option<Instant>>,
+}
+
+impl WhoisGate {
+    fn new(permits: usize, limit: Duration) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(permits)),
+            limit,
+            inner: Mutex::new(WhoisInner {
+                cache: HashMap::new(),
+                busy: HashMap::new(),
+            }),
+            err_at: Mutex::new(None),
+        }
+    }
+
+    fn log_err(&self, now: Instant) -> bool {
+        let mut last = self.err_at.lock().unwrap();
+        let log = last.is_none_or(|t| now.saturating_duration_since(t) >= RECHECK);
+        if log {
+            *last = Some(now);
+        }
+        log
+    }
+
+    async fn lookup<F, Fut>(
+        &self,
+        peer: IpAddr,
+        generation: u64,
+        now: Instant,
+        fetch: F,
+    ) -> Option<Value>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Option<Value>>,
+    {
+        enum Step {
+            Join(Arc<Flight>),
+            Lead(Arc<Flight>),
+        }
+        let step = {
+            let mut g = self.inner.lock().unwrap();
+            if let Some((cached_gen, at, value)) = g.cache.get(&peer)
+                && *cached_gen == generation
+                && now.saturating_duration_since(*at) < self.limit
+            {
+                return Some(value.clone());
+            }
+            if let Some(flight) = g.busy.get(&peer)
+                && flight.generation == generation
+            {
+                Step::Join(Arc::clone(flight))
+            } else {
+                let flight = Arc::new(Flight {
+                    generation,
+                    slot: Mutex::new(None),
+                    wake: Notify::new(),
+                });
+                g.busy.insert(peer, Arc::clone(&flight));
+                Step::Lead(flight)
+            }
+        };
+        let flight = match step {
+            Step::Join(flight) => return flight.wait(self.limit).await,
+            Step::Lead(flight) => flight,
+        };
+        let Ok(Ok(_permit)) =
+            tokio::time::timeout(self.limit, Arc::clone(&self.permits).acquire_owned()).await
+        else {
+            self.retire(peer, &flight, generation, now, None);
+            return None;
+        };
+        let value = tokio::time::timeout(self.limit, fetch()).await.ok().flatten();
+        self.retire(peer, &flight, generation, now, value.clone());
+        value
+    }
+
+    fn retire(
+        &self,
+        peer: IpAddr,
+        flight: &Arc<Flight>,
+        generation: u64,
+        now: Instant,
+        value: Option<Value>,
+    ) {
+        flight.finish(value.clone());
+        let mut g = self.inner.lock().unwrap();
+        if let Some(value) = value {
+            if g.cache.len() >= 64 {
+                g.cache.clear();
+            }
+            g.cache.insert(peer, (generation, now, value));
+        }
+        if g.busy
+            .get(&peer)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            g.busy.remove(&peer);
+        }
+    }
+}
+
+fn whois_gate() -> &'static WhoisGate {
+    static GATE: std::sync::OnceLock<WhoisGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| WhoisGate::new(WHOIS_LIMIT, CLI_TIMEOUT))
+}
+
+async fn fetch_whois(peer: IpAddr) -> Option<Value> {
+    match json_within(&["whois", "--json", &peer.to_string()], CLI_TIMEOUT).await {
+        Ok(value) => Some(value),
+        Err(e) => {
+            if whois_gate().log_err(Instant::now()) {
+                tracing::warn!("tailscale whois {peer}: {e:#}");
+            }
+            None
+        }
+    }
+}
+
+async fn peer_record(peer: IpAddr) -> Option<Value> {
+    let peer = peer.to_canonical();
+    let generation = OWNER_GEN.load(Ordering::Acquire);
+    whois_gate()
+        .lookup(peer, generation, Instant::now(), || fetch_whois(peer))
+        .await
+}
+
 /// Who a tailnet device belongs to: its user's login name, or `None` for a device that
 /// isn't anyone's (tagged, e.g. a server), or one off the tailnet.
 pub async fn identity(peer: IpAddr) -> Option<String> {
@@ -562,13 +819,7 @@ pub async fn identity(peer: IpAddr) -> Option<String> {
     if !is_tailscale_ip(peer) {
         return None;
     }
-    match json(&["whois", "--json", &peer.to_string()]).await {
-        Ok(who) => login_of(&who),
-        Err(e) => {
-            tracing::warn!("tailscale whois {peer}: {e:#}");
-            None
-        }
-    }
+    login_of(&peer_record(peer).await?)
 }
 
 /// A whois answer's person: tagged devices have none ("tagged-devices").
@@ -584,14 +835,12 @@ pub async fn whois(peer: IpAddr) -> Option<Value> {
     if !is_tailscale_ip(peer) {
         return None;
     }
-    json(&["whois", "--json", &peer.to_string()]).await.ok()
+    peer_record(peer).await
 }
 
 /// A tailnet device's name (e.g. "nathans-ipad"), for showing who's connected.
 pub async fn device_name(peer: IpAddr) -> Option<String> {
-    let who = json(&["whois", "--json", &peer.to_canonical().to_string()])
-        .await
-        .ok()?;
+    let who = peer_record(peer).await?;
     let name = who["Node"]["ComputedName"]
         .as_str()
         .or_else(|| who["Node"]["Hostinfo"]["Hostname"].as_str())?;
@@ -601,6 +850,7 @@ pub async fn device_name(peer: IpAddr) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn a_person_owns_a_device_a_tag_does_not() {
@@ -647,145 +897,147 @@ mod tests {
         assert!(self_addresses(&empty).is_err());
     }
 
-    async fn step(owner: &TailnetOwner, found: NodeOwner) -> Refresh {
-        owner.refresh_with(move || async move { found }).await
-    }
-
-    #[tokio::test]
-    async fn owner_follows_tailscale_coming_up_changing_and_tagged() {
-        let owner = TailnetOwner::unknown();
-        let down = || NodeOwner::Unavailable("down".into());
-
-        let first = step(&owner, down()).await;
-        assert!(first.unavailable);
-        assert_eq!(first.announce, None);
-        assert_eq!(first.wait, Duration::from_secs(1));
-        assert_eq!(owner.get(), None, "unknown means a token is required");
-
-        let retry = step(&owner, down()).await;
-        assert!(!retry.unavailable, "retries stay quiet");
-        assert_eq!(retry.wait, Duration::from_secs(2));
-        assert_eq!(owner.get(), None);
-
-        let up = step(&owner, NodeOwner::User("ada@example.com".into())).await;
-        assert_eq!(up.announce.as_deref(), Some("ada@example.com"));
-        assert_eq!(up.wait, Duration::from_secs(30));
-        assert_eq!(owner.get().as_deref(), Some("ada@example.com"));
-
-        let again = step(&owner, NodeOwner::User("ada@example.com".into())).await;
-        assert_eq!(again.announce, None, "the same owner is logged once");
-        assert_eq!(owner.get().as_deref(), Some("ada@example.com"));
-
-        // A daemon blip is not a new owner, and not a reason to forget the last one.
-        let blip = step(&owner, down()).await;
-        assert!(!blip.unavailable);
-        assert_eq!(blip.wait, Duration::from_secs(1));
-        assert_eq!(owner.get().as_deref(), Some("ada@example.com"));
-
-        let switched = step(&owner, NodeOwner::User("bea@example.com".into())).await;
-        assert_eq!(switched.announce.as_deref(), Some("bea@example.com"));
-        assert_eq!(owner.get().as_deref(), Some("bea@example.com"));
-
-        let tagged = step(&owner, NodeOwner::Nobody).await;
-        assert_eq!(tagged.announce, None);
-        assert_eq!(tagged.wait, Duration::from_secs(30));
-        assert_eq!(owner.get(), None, "a tagged node has no owner");
-
-        // Untagged again: that login is the owner, and devices can skip the token once more.
-        let restored = step(&owner, NodeOwner::User("ada@example.com".into())).await;
-        assert_eq!(restored.announce.as_deref(), Some("ada@example.com"));
-        assert_eq!(owner.get().as_deref(), Some("ada@example.com"));
-    }
-
     #[test]
-    fn unknown_owner_backs_off_up_to_thirty_seconds() {
+    fn unknown_owner_backs_off_and_a_failed_read_drops_the_login() {
         let owner = TailnetOwner::unknown();
+        let now = Instant::now();
         let waits: Vec<_> = (0..8)
-            .map(|_| owner.commit(NodeOwner::Unavailable("down".into())).wait)
+            .map(|i| {
+                let outcome = owner.commit(NodeOwner::Unavailable("down".into()), now);
+                assert_eq!(outcome.logged_down, i == 0);
+                outcome.wait
+            })
             .collect();
-        assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30, 30].map(Duration::from_secs));
+        assert_eq!(
+            waits,
+            [1, 2, 4, 8, 16, 30, 30, 30].map(Duration::from_secs)
+        );
+        assert_eq!(owner.get(), None);
+
+        let ada = owner.commit(NodeOwner::User("ada@example.com".into()), now);
+        assert!(ada.logged_owner);
+        assert_eq!(ada.wait, RECHECK);
+        assert_eq!(owner.get().as_deref(), Some("ada@example.com"));
+        let generation = owner.generation();
+        let again = owner.commit(NodeOwner::User("ada@example.com".into()), now);
+        assert!(!again.logged_owner, "the same owner is logged once");
+        assert_eq!(owner.generation(), generation, "a repeat read keeps whois usable");
+
+        let down = owner.commit(NodeOwner::Unavailable("timed out".into()), now);
+        assert!(down.logged_down);
+        assert_eq!(down.wait, Duration::from_secs(1));
+        assert_eq!(owner.get(), None, "a failed read forgets the owner");
+        assert_ne!(owner.generation(), generation);
+
+        assert!(
+            owner
+                .commit(NodeOwner::User("bea@example.com".into()), now)
+                .logged_owner
+        );
+        let tagged = owner.commit(NodeOwner::Nobody, now);
+        assert!(tagged.logged_out);
+        assert_eq!(tagged.wait, RECHECK);
+        assert_eq!(owner.get(), None, "a tagged node has no owner");
+        assert!(!owner.commit(NodeOwner::Nobody, now).logged_out);
+        assert!(
+            owner
+                .commit(NodeOwner::User("ada@example.com".into()), now)
+                .logged_owner,
+            "untagged again, that login is announced once more"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_switch_and_a_missed_status_require_a_token() {
+        let owner = TailnetOwner::unknown();
+        let t = Instant::now();
+        let got = owner
+            .resolve_with(t, || async { NodeOwner::User("ada@example.com".into()) })
+            .await;
+        assert_eq!(got.as_deref(), Some("ada@example.com"));
+
+        let calls = AtomicUsize::new(0);
+        let got = owner
+            .resolve_with(t + Duration::from_millis(200), || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                NodeOwner::User("bea@example.com".into())
+            })
+            .await;
+        assert_eq!(got.as_deref(), Some("ada@example.com"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a fresh status is reused");
+
+        let got = owner
+            .resolve_with(t + FRESH + Duration::from_millis(50), || async {
+                NodeOwner::User("bea@example.com".into())
+            })
+            .await;
+        assert_eq!(got.as_deref(), Some("bea@example.com"));
+
+        let missed = t + (FRESH * 2) + Duration::from_millis(100);
+        let got = owner
+            .resolve_with(missed, || async {
+                NodeOwner::Unavailable("Starting".into())
+            })
+            .await;
+        assert_eq!(got, None, "Starting is not an owner");
+        assert_eq!(owner.get(), None);
+
+        let calls = AtomicUsize::new(0);
+        let got = owner
+            .resolve_with(missed + Duration::from_millis(20), || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                NodeOwner::User("bea@example.com".into())
+            })
+            .await;
+        assert_eq!(
+            got, None,
+            "a throttled recheck does not restore the previous owner"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(owner.get(), None);
     }
 
     #[tokio::test]
-    async fn lazy_resolve_asks_once_while_unknown_and_not_when_settled() {
+    async fn in_flight_refresh_does_not_grant_the_previous_owner() {
         let owner = TailnetOwner::unknown();
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let now = Instant::now();
-        let gap = Duration::from_secs(1);
-        let ask = |found: NodeOwner| {
-            let calls = &calls;
+        let t = Instant::now();
+        owner
+            .resolve_with(t, || async { NodeOwner::User("ada@example.com".into()) })
+            .await
+            .unwrap();
+        let when = t + FRESH + Duration::from_secs(1);
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let waiting = entered.notified();
+        tokio::pin!(waiting);
+        let lead = tokio::spawn({
+            let owner = owner.clone();
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
             async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                found
+                owner
+                    .resolve_with(when, || async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        NodeOwner::User("bea@example.com".into())
+                    })
+                    .await
             }
-        };
-
-        let first = owner
-            .resolve_with(now, gap, || ask(NodeOwner::Unavailable("down".into())))
-            .await;
-        assert_eq!(first, None);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let burst = owner
-            .resolve_with(now + Duration::from_millis(10), gap, || {
-                ask(NodeOwner::User("ada@example.com".into()))
-            })
-            .await;
-        assert_eq!(
-            burst, None,
-            "a second connection inside the gap does not ask again"
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(owner.get(), None);
-
-        let later = owner
-            .resolve_with(now + Duration::from_secs(2), gap, || {
-                ask(NodeOwner::User("ada@example.com".into()))
-            })
-            .await;
-        assert_eq!(later.as_deref(), Some("ada@example.com"));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        let settled = owner
-            .resolve_with(now + Duration::from_secs(3), gap, || ask(NodeOwner::Nobody))
-            .await;
-        assert_eq!(settled.as_deref(), Some("ada@example.com"));
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "a known owner is not asked on connect"
-        );
-
-        let tagged = TailnetOwner::unknown();
-        tagged.commit(NodeOwner::Nobody);
-        let tagged_calls = std::sync::atomic::AtomicUsize::new(0);
-        let got = tagged
-            .resolve_with(now, gap, || async {
-                tagged_calls.fetch_add(1, Ordering::SeqCst);
+        });
+        waiting.await;
+        release.notify_waiters();
+        let calls = AtomicUsize::new(0);
+        let followed = owner
+            .resolve_with(when, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
                 NodeOwner::User("ada@example.com".into())
             })
             .await;
-        assert_eq!(got, None);
-        assert_eq!(tagged_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(tagged.get(), None, "tagged stays without an owner");
-
-        let unknown = TailnetOwner::unknown();
-        unknown.inner.in_flight.store(true, Ordering::SeqCst);
-        let busy = std::sync::atomic::AtomicUsize::new(0);
-        let blocked = unknown
-            .resolve_with(now, gap, || async {
-                busy.fetch_add(1, Ordering::SeqCst);
-                NodeOwner::User("ada@example.com".into())
-            })
-            .await;
-        assert_eq!(blocked, None);
-        assert_eq!(
-            busy.load(Ordering::SeqCst),
-            0,
-            "an in-flight lookup is not duplicated"
-        );
-        assert_eq!(unknown.get(), None);
+        let led = lead.await.unwrap();
+        assert_eq!(led.as_deref(), Some("bea@example.com"));
+        assert_eq!(followed.as_deref(), Some("bea@example.com"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the in-flight read is shared");
+        assert_ne!(followed.as_deref(), Some("ada@example.com"));
     }
 
     #[test]
@@ -838,5 +1090,172 @@ mod tests {
         assert!(serve_status_proxies_to(&on, 8080));
         assert!(!serve_status_proxies_to(&on, 9090));
         assert!(!serve_status_proxies_to(&serde_json::json!({}), 8080));
+    }
+
+    #[test]
+    fn whois_errors_are_logged_once_per_quiet_period() {
+        let gate = WhoisGate::new(1, CLI_TIMEOUT);
+        let t = Instant::now();
+        assert!(gate.log_err(t));
+        assert!(!gate.log_err(t + Duration::from_secs(1)));
+        assert!(gate.log_err(t + RECHECK));
+    }
+
+    #[tokio::test]
+    async fn whois_coalesces_and_drops_its_cache_when_the_owner_generation_changes() {
+        let gate = Arc::new(WhoisGate::new(4, Duration::from_secs(2)));
+        let peer: IpAddr = "100.70.0.1".parse().unwrap();
+        let now = Instant::now();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let waiting = entered.notified();
+        tokio::pin!(waiting);
+
+        let lead_gate = Arc::clone(&gate);
+        let lead_calls = Arc::clone(&calls);
+        let lead_entered = Arc::clone(&entered);
+        let lead_release = Arc::clone(&release);
+        let lead = tokio::spawn(async move {
+            lead_gate
+                .lookup(peer, 3, now, || async move {
+                    lead_calls.fetch_add(1, Ordering::SeqCst);
+                    lead_entered.notify_one();
+                    lead_release.notified().await;
+                    Some(serde_json::json!({"ok": true}))
+                })
+                .await
+        });
+        waiting.await;
+        let followed_calls = Arc::clone(&calls);
+        let followed = gate.lookup(peer, 3, now, || async move {
+            followed_calls.fetch_add(1, Ordering::SeqCst);
+            Some(serde_json::json!({"ok": false}))
+        });
+        release.notify_waiters();
+        let (led, followed) = tokio::join!(lead, followed);
+        let led = led.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one lookup serves both waiters");
+        assert_eq!(led, followed);
+        assert_eq!(led.unwrap()["ok"], true);
+
+        let hit_calls = Arc::clone(&calls);
+        let hit = gate
+            .lookup(peer, 3, now, || async move {
+                hit_calls.fetch_add(1, Ordering::SeqCst);
+                Some(serde_json::json!({"ok": false}))
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "same generation reuses the read");
+        assert_eq!(hit.unwrap()["ok"], true);
+
+        let next_calls = Arc::clone(&calls);
+        let next = gate
+            .lookup(peer, 4, now, || async move {
+                next_calls.fetch_add(1, Ordering::SeqCst);
+                Some(serde_json::json!({"ok": "new"}))
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a new owner generation misses");
+        assert_eq!(next.unwrap()["ok"], "new");
+    }
+
+    #[tokio::test]
+    async fn whois_fails_closed_when_the_lookup_cap_is_full() {
+        let gate = Arc::new(WhoisGate::new(1, Duration::from_millis(50)));
+        let hold: IpAddr = "100.64.0.1".parse().unwrap();
+        let other: IpAddr = "100.64.0.2".parse().unwrap();
+        let now = Instant::now();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let waiting = entered.notified();
+        tokio::pin!(waiting);
+        let lead_gate = Arc::clone(&gate);
+        let lead_entered = Arc::clone(&entered);
+        let lead_release = Arc::clone(&release);
+        let lead = tokio::spawn(async move {
+            lead_gate
+                .lookup(hold, 1, now, || async move {
+                    lead_entered.notify_one();
+                    lead_release.notified().await;
+                    Some(serde_json::json!({"held": true}))
+                })
+                .await
+        });
+        waiting.await;
+        let blocked = gate
+            .lookup(other, 1, now, || async move {
+                Some(serde_json::json!({"ran": true}))
+            })
+            .await;
+        assert_eq!(blocked, None, "past the cap, whois does not run");
+        release.notify_waiters();
+        assert!(lead.await.unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(windows)]
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .is_ok_and(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .any(|word| word == pid.to_string())
+            })
+    }
+
+    fn echo_cmd() -> (&'static str, &'static [&'static str]) {
+        #[cfg(windows)]
+        {
+            ("cmd", &["/C", "echo", "glass-ok"])
+        }
+        #[cfg(not(windows))]
+        {
+            ("echo", &["glass-ok"])
+        }
+    }
+
+    fn hang_cmd() -> (&'static str, &'static [&'static str]) {
+        #[cfg(windows)]
+        {
+            ("ping", &["-n", "60", "127.0.0.1"])
+        }
+        #[cfg(not(windows))]
+        {
+            ("sleep", &["30"])
+        }
+    }
+
+    #[tokio::test]
+    async fn child_output_is_collected_and_a_hang_is_killed_and_reaped() {
+        let (program, args) = echo_cmd();
+        let out = finish(spawn(program, args).unwrap(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "glass-ok");
+
+        let (program, args) = hang_cmd();
+        let child = spawn(program, args).unwrap();
+        let pid = child.id().expect("child pid");
+        let started = Instant::now();
+        let result = finish(child, Duration::from_millis(200)).await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timed out child was not killed"
+        );
+        assert!(!process_alive(pid), "pid {pid} is still running");
     }
 }

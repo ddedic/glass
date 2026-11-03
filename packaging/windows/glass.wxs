@@ -75,8 +75,12 @@
 
     <!-- Installed by hand (with its window): open the app, as the person who ran it, to set
          Glass up. A silent install (/qn) leaves that to sign-in. -->
-    <!-- The firewall rule follows the saved bind. Return is ignore: failing the install
-         would roll back to the previous MSI, and that package installs a wide exception. -->
+    <!-- The firewall rule follows the saved bind. Return stays ignore: failing this
+         action would roll the install back onto the previous MSI, which installs a wide
+         exception. The sync removes owned allow rules before it exits, including when
+         the saved bind cannot be read, so it does not leave a wide rule it owns. If
+         that removal itself fails, this process exits non-zero and the MSI log records
+         it; failing the transaction would restore the old wide exception. -->
     <CustomAction Id="SyncFirewall" FileRef="GlassExe" ExeCommand="--glass-firewall-sync" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="OpenGlass" Directory="BinFolder" ExeCommand="&quot;[#GlasswExe]&quot; app" Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
     <!-- Uninstalled for good (not upgraded): the optional secure-desktop service runs this

@@ -95,6 +95,11 @@ fn firewall_step() -> Result<()> {
              loopback, so Glass will remove its inbound allow rule. Windows asks for\n\
              administrator approval once.",
         )?,
+        RemoteScope::Unknown => note(
+            "Couldn't read the saved listen address",
+            "Glass couldn't read a saved bind, so it will remove its inbound allow rules\n\
+             rather than leave a wider one in place. Windows asks for administrator approval once.",
+        )?,
         RemoteScope::Any => note(
             "Let your other devices connect",
             "Windows Defender Firewall blocks incoming connections until a program is allowed.\n\
@@ -102,7 +107,13 @@ fn firewall_step() -> Result<()> {
              not public ones like a café's. Windows asks for administrator approval once.",
         )?,
     }
-    let question = if updating { "Update the firewall rule now?" } else { "Add the rule now?" };
+    let question = if wanted == RemoteScope::Unknown {
+        "Remove the Glass allow rules now?"
+    } else if updating {
+        "Update the firewall rule now?"
+    } else {
+        "Add the rule now?"
+    };
     if !confirm(question).initial_value(true).interact()? {
         if wanted == RemoteScope::Any && !updating {
             log::warning("Skipped: Windows will ask when Glass first starts. Choose Allow there.")?;
@@ -155,6 +166,9 @@ pub fn prepare_unattended() -> Vec<crate::setup::Need> {
             ),
             RemoteScope::Loopback => format!(
                 "Glass listens on this computer only, so it should have no inbound firewall rule. Run `glass setup`, or as administrator:\n{commands}"
+            ),
+            RemoteScope::Unknown => format!(
+                "Glass couldn't read the saved listen address, so its inbound allow rules should be removed rather than left wide. Run `glass setup`, or as administrator:\n{commands}"
             ),
             RemoteScope::Any => format!(
                 "Allow Glass through Windows Defender Firewall on private networks: run `glass setup` on the computer (asks for administrator approval once), or as administrator:\n{commands}"

@@ -9,22 +9,32 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, VARIANT_FALSE, VARIANT_TRUE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, HANDLE, HLOCAL, LocalFree, VARIANT_FALSE, VARIANT_TRUE, WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows::Win32::NetworkManagement::WindowsFirewall::{
     INetFwPolicy2, INetFwRule, INetFwRule2, INetFwRules, NET_FW_ACTION_ALLOW, NET_FW_ACTION_BLOCK, NET_FW_EDGE_TRAVERSAL_TYPE_ALLOW,
     NET_FW_EDGE_TRAVERSAL_TYPE_DEFER_TO_APP, NET_FW_EDGE_TRAVERSAL_TYPE_DEFER_TO_USER, NET_FW_EDGE_TRAVERSAL_TYPE_DENY,
     NET_FW_IP_PROTOCOL_ANY, NET_FW_RULE_DIR_IN, NetFwPolicy2, NetFwRule,
 };
+use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, LookupPrivilegeValueW, PSECURITY_DESCRIPTOR, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_PRIVILEGES, TOKEN_QUERY,
+};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize, IDispatch};
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows::Win32::System::Ole::IEnumVARIANT;
-use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW, RegGetValueW, RegLoadKeyW,
+    RegOpenKeyExW, RegUnLoadKeyW,
+};
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::System::Variant::{VARIANT, VT_DISPATCH, VariantClear};
 use windows::core::{BSTR, HSTRING, Interface, w};
 
 use super::firewall_scope::{
-    AllowSpec, Coverage, Edge, FwRule, ListFail, PROFILE_PRIVATE, RULE_NAME, RemoteScope, ScopePlan, TAILSCALE_V4, TAILSCALE_V6,
-    coverage, is_glass_name, manual_delete, manual_netsh, plan_from_binds, preview, programs_match, reconcile_stable, selected_programs,
+    AllowSpec, Coverage, Edge, FwRule, GROUPING, ListFail, PROFILE_PRIVATE, REMOTE_UNREADABLE, RULE_NAME, RemoteScope, ScopePlan, TAILSCALE_V4,
+    TAILSCALE_V6, coverage, is_glass_name, manual_delete, manual_netsh, owned_allow, plan_from_binds, preview, programs_match,
+    reconcile_stable, scope_for_saved, selected_programs,
 };
 
 /// Hidden argument the elevated helper runs. `glass setup` starts it, so changing bind
@@ -111,7 +121,7 @@ pub fn programs() -> Vec<PathBuf> {
     if super::service::is_elevated() {
         candidates.extend(other_user_exes());
     }
-    let flagged: Vec<(String, bool)> = candidates.iter().map(|path| (path.display().to_string(), path.is_file())).collect();
+    let flagged: Vec<(String, bool)> = candidates.iter().map(|path| (path.display().to_string(), path_present(path))).collect();
     let pairs: Vec<(&str, bool)> = flagged.iter().map(|(path, exists)| (path.as_str(), *exists)).collect();
     selected_programs(&pairs).into_iter().map(PathBuf::from).collect()
 }
@@ -120,8 +130,8 @@ pub fn inspect() -> Vec<ProgramView> {
     let plan = scope_plan();
     let paths = programs();
     match read_rules() {
-        Ok(rules) => views_from(&paths, &rules, plan, false),
-        Err(ListFail::Incomplete(rules)) => views_from(&paths, &rules, plan, true),
+        Ok(rules) => views_from(&with_ruled(paths, &rules), &rules, plan, false),
+        Err(ListFail::Incomplete(rules)) => views_from(&with_ruled(paths, &rules), &rules, plan, true),
         Err(ListFail::Unavailable(message)) => unreadable(&paths, plan.scope, &format!("Couldn't read Windows Firewall ({message}).")),
     }
 }
@@ -135,6 +145,11 @@ pub fn sync() -> Vec<ProgramView> {
         return unreadable(&programs(), plan.scope, "Another Glass firewall update is still running. Run `glass setup` again.");
     };
     let paths = programs();
+    // A program that was deleted can still have a Glass allow. Reconcile that path too.
+    let paths = match read_rules() {
+        Ok(rules) | Err(ListFail::Incomplete(rules)) => with_ruled(paths, &rules),
+        Err(ListFail::Unavailable(_)) => paths,
+    };
     let names: Vec<String> = paths.iter().map(|path| path.display().to_string()).collect();
     let mut store = ComStore;
     match reconcile_stable(&mut store, &names, scope_plan) {
@@ -228,7 +243,7 @@ pub fn ready_sentence(scope: RemoteScope) -> &'static str {
     match scope {
         RemoteScope::Any => "Glass can accept connections on private networks",
         RemoteScope::Tailscale => "Glass accepts connections from Tailscale only, on private networks",
-        RemoteScope::Loopback => "Glass listens on this computer only, so it has no inbound firewall rule",
+        RemoteScope::Loopback | RemoteScope::Unknown => "Glass listens without a Glass inbound allow rule",
     }
 }
 
@@ -240,13 +255,13 @@ pub fn blocked_hint() -> &'static str {
 
 pub fn foreign_warning(scope: RemoteScope) -> &'static str {
     match scope {
-        RemoteScope::Loopback => {
-            "Another firewall rule for this program still allows inbound connections. Glass only changes rules named Glass."
+        RemoteScope::Loopback | RemoteScope::Unknown => {
+            "Another firewall rule for this program still allows inbound connections. Glass only changes rules it created."
         }
         RemoteScope::Tailscale => {
-            "Another firewall rule for this program still allows more than Tailscale. Glass only changes rules named Glass."
+            "Another firewall rule for this program still allows more than Tailscale. Glass only changes rules it created."
         }
-        RemoteScope::Any => "Another firewall rule for this program is still in place. Glass only changes rules named Glass.",
+        RemoteScope::Any => "Another firewall rule for this program is still in place. Glass only changes rules it created.",
     }
 }
 
@@ -272,7 +287,7 @@ pub fn install_lines(views: &[ProgramView]) -> Vec<String> {
 pub fn manual_command(path: &Path, scope: RemoteScope, has_glass_allow: bool) -> String {
     let program = path.to_string_lossy();
     let add = match scope {
-        RemoteScope::Loopback => None,
+        RemoteScope::Loopback | RemoteScope::Unknown => None,
         RemoteScope::Any => manual_netsh(&program, AllowSpec::Any),
         RemoteScope::Tailscale => manual_netsh(&program, AllowSpec::TailscaleBoth),
     };
@@ -292,18 +307,45 @@ pub fn remove_rule_quietly(exe: &Path) -> bool {
     delete_glass_rules(&exe.display().to_string()).is_ok()
 }
 
+/// Missing is absent. A permission error is still present: skipping it would leave its rule.
+fn path_present(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(meta) => meta.is_file(),
+    }
+}
+
+/// Programs that already have a Glass-owned allow, even when the file is gone.
+fn with_ruled(mut paths: Vec<PathBuf>, rules: &[FwRule]) -> Vec<PathBuf> {
+    for rule in rules {
+        if !owned_allow(rule) || rule.program.trim().is_empty() {
+            continue;
+        }
+        if paths.iter().any(|have| programs_match(&have.display().to_string(), &rule.program)) {
+            continue;
+        }
+        paths.push(PathBuf::from(&rule.program));
+    }
+    paths
+}
+
 fn views_from(paths: &[PathBuf], rules: &[FwRule], plan: ScopePlan, incomplete: bool) -> Vec<ProgramView> {
+    let unknown = plan.scope == RemoteScope::Unknown;
     paths
         .iter()
         .map(|path| {
             let seen = preview(rules, &path.display().to_string(), plan);
-            let needs = seen.needs_change || incomplete;
+            // Unknown is never Ready, even when nothing is installed yet.
+            let needs = unknown || seen.needs_change || incomplete;
             ProgramView {
                 path: path.clone(),
                 state: if needs { State::NeedsChange } else { State::Ready },
                 blocked: seen.blocked,
                 foreign_wider: seen.foreign_wider,
-                detail: if incomplete {
+                detail: if unknown {
+                    "Couldn't read the saved bind. Run `glass setup` again so a wider Glass allow is not left behind.".into()
+                } else if incomplete {
                     "Windows Firewall could not be listed completely. Run `glass setup` again.".into()
                 } else {
                     String::new()
@@ -358,38 +400,46 @@ fn change_hint(scope: RemoteScope, foreign: bool) -> String {
             "Windows Firewall still allows more than Tailscale. Apply the Tailscale-only rule with: glass setup"
         }
         RemoteScope::Loopback => "Windows Firewall still has an inbound rule for Glass. Remove it with: glass setup",
+        RemoteScope::Unknown => "Couldn't read the saved listen address. Run `glass setup` again so a wider Glass allow is not left behind.",
         RemoteScope::Any => "Windows Firewall still has a different rule for Glass. Apply it with: glass setup",
     };
     if foreign { format!("{lead}\n{}", foreign_warning(scope)) } else { lead.into() }
 }
 
-/// Saved bind for this reconcile. An elevated process also reads other users' settings,
-/// and the narrowest of those wins, because the Program Files copy has one rule shared
-/// by every account. A profile that cannot be read suppresses a new wide rule.
+/// Saved bind for this reconcile. An elevated process reads every registered profile's
+/// real roaming AppData (including folder redirection) and the sign-in settings copy.
+/// A file that is missing is the default bind. A file or profile that cannot be read
+/// is [`RemoteScope::Unknown`]: owned allows are removed and nothing wide is created.
 fn scope_plan() -> ScopePlan {
-    if !super::service::is_elevated() {
-        let path = crate::settings::path();
-        if !path.is_file() {
-            return plan_from_binds(&[], false);
-        }
-        return match read_bind(&path) {
-            Ok(bind) => plan_from_binds(&[bind], false),
-            Err(()) => plan_from_binds(&[], true),
-        };
-    }
     let mut binds = Vec::new();
     let mut unreadable = false;
-    let own = crate::settings::path();
-    if own.is_file() {
-        match read_bind(&own) {
-            Ok(bind) => binds.push(bind),
+    consider_settings(&crate::settings::path(), &mut binds, &mut unreadable);
+    if super::service::is_elevated() {
+        consider_settings(&super::service::signin_dir().join("settings.json"), &mut binds, &mut unreadable);
+        match accounts() {
+            Ok(found) => {
+                for account in found {
+                    consider_settings(&account.roaming.join(r"Glass\settings.json"), &mut binds, &mut unreadable);
+                }
+            }
             Err(()) => unreadable = true,
         }
     }
-    let (more, failed) = other_user_binds(&own);
-    binds.extend(more);
-    unreadable |= failed;
     plan_from_binds(&binds, unreadable)
+}
+
+/// Missing is absent. Anything else, including a file that does not parse with
+/// [`crate::listen::parse_bind`], is unreadable.
+fn consider_settings(path: &Path, binds: &mut Vec<Vec<String>>, unreadable: &mut bool) {
+    match std::fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => *unreadable = true,
+        Ok(meta) if !meta.is_file() => *unreadable = true,
+        Ok(_) => match read_bind(path) {
+            Ok(bind) => binds.push(bind),
+            Err(()) => *unreadable = true,
+        },
+    }
 }
 
 fn read_bind(path: &Path) -> Result<Vec<String>, ()> {
@@ -399,48 +449,201 @@ fn read_bind(path: &Path) -> Result<Vec<String>, ()> {
         bind: Vec<String>,
     }
     let bytes = std::fs::read(path).map_err(|_| ())?;
-    serde_json::from_slice::<File>(&bytes).map(|file| file.bind).map_err(|_| ())
+    let raw = serde_json::from_slice::<File>(&bytes).map(|file| file.bind).map_err(|_| ())?;
+    // Same splitter the listener uses. A value it rejects is not a wide rule.
+    scope_for_saved(&raw)?;
+    crate::listen::parse_bind(&raw).map_err(|_| ())
 }
 
-/// Binds that could be read, and whether any profile was unreadable. A readable
-/// Tailscale setting is kept even when another profile cannot be parsed.
-fn other_user_binds(skip: &Path) -> (Vec<Vec<String>>, bool) {
+struct Account {
+    roaming: PathBuf,
+    local: PathBuf,
+}
+
+/// Registered user profiles (`S-1-5-21-*`), with roaming and local AppData from the
+/// user's shell folders. That is the redirected path when folder redirection is set.
+/// `Err` if a profile exists and its folders cannot be read: guessing `C:\Users` would
+/// hide a Tailscale bind and authorize a wide rule.
+fn accounts() -> Result<Vec<Account>, ()> {
+    let key = open_key(HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList")?;
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(users_dir().unwrap_or_default()) else { return (out, true) };
-    let mut unreadable = false;
-    for entry in entries.flatten() {
-        if skip_profile(&entry.file_name().to_string_lossy()) {
+    let mut index = 0u32;
+    loop {
+        let mut name = [0u16; 256];
+        let mut len = name.len() as u32;
+        let err = unsafe { RegEnumKeyExW(key, index, Some(windows::core::PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None) };
+        if err == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if err.is_err() {
+            unsafe { let _ = RegCloseKey(key); }
+            return Err(());
+        }
+        index += 1;
+        let sid = String::from_utf16_lossy(&name[..len as usize]);
+        if !sid.starts_with("S-1-5-21-") {
             continue;
         }
-        let file = entry.path().join(r"AppData\Roaming\Glass\settings.json");
-        if !file.is_file() || programs_match(&file.display().to_string(), &skip.display().to_string()) {
-            continue;
-        }
-        match read_bind(&file) {
-            Ok(bind) => out.push(bind),
-            Err(()) => unreadable = true,
+        let image = match reg_string(key, &sid, "ProfileImagePath") {
+            Ok(path) => PathBuf::from(expand_env(&path)),
+            Err(Missing::Gone) => continue,
+            Err(Missing::Failed) => {
+                unsafe { let _ = RegCloseKey(key); }
+                return Err(());
+            }
+        };
+        match account_folders(&sid, &image) {
+            Ok(Some(account)) => out.push(account),
+            Ok(None) => {}
+            Err(()) => {
+                unsafe { let _ = RegCloseKey(key); }
+                return Err(());
+            }
         }
     }
-    (out, unreadable)
+    unsafe { let _ = RegCloseKey(key); }
+    Ok(out)
+}
+
+enum Missing {
+    Gone,
+    Failed,
+}
+
+fn account_folders(sid: &str, profile: &Path) -> Result<Option<Account>, ()> {
+    let shell = format!(r"{sid}\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders");
+    if let Some(account) = shell_folders(HKEY_USERS, &shell, profile)? {
+        return Ok(Some(account));
+    }
+    let dat = profile.join("NTUSER.DAT");
+    // `is_file` is false for a permission error too. That is not "no profile".
+    match std::fs::metadata(&dat) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+        Ok(meta) if !meta.is_file() => return Err(()),
+        Ok(_) => {}
+    }
+    let _priv = enable_restore();
+    let loaded = format!("GlassFw{}", sid.replace('-', ""));
+    let file = HSTRING::from(dat.as_os_str());
+    let sub = HSTRING::from(&loaded);
+    if unsafe { RegLoadKeyW(HKEY_USERS, &sub, &file) }.is_err() {
+        return Err(());
+    }
+    let hive = Hive(loaded);
+    let nested = format!(r"{}\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders", hive.0);
+    let found = shell_folders(HKEY_USERS, &nested, profile)?;
+    drop(hive);
+    found.map(Some).ok_or(())
+}
+
+struct Hive(String);
+
+impl Drop for Hive {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = RegUnLoadKeyW(HKEY_USERS, &HSTRING::from(&self.0));
+        }
+    }
+}
+
+/// `Ok(None)` when that hive is not loaded. A value that cannot be read is `Err`.
+fn shell_folders(root: HKEY, subkey: &str, profile: &Path) -> Result<Option<Account>, ()> {
+    let key = match open_key(root, subkey) {
+        Ok(key) => key,
+        Err(()) => return Ok(None),
+    };
+    let roaming = folder_value(key, "AppData", profile, r"AppData\Roaming");
+    let local = folder_value(key, "Local AppData", profile, r"AppData\Local");
+    unsafe { let _ = RegCloseKey(key); }
+    match (roaming, local) {
+        (Ok(roaming), Ok(local)) => Ok(Some(Account { roaming, local })),
+        _ => Err(()),
+    }
+}
+
+fn folder_value(key: HKEY, value: &str, profile: &Path, fallback: &str) -> Result<PathBuf, Missing> {
+    match reg_string(key, "", value) {
+        Ok(raw) => Ok(PathBuf::from(expand_user_path(&raw, profile))),
+        Err(Missing::Gone) => Ok(profile.join(fallback)),
+        Err(Missing::Failed) => Err(Missing::Failed),
+    }
+}
+
+fn expand_user_path(raw: &str, profile: &Path) -> String {
+    let profile = profile.display().to_string();
+    let lower = raw.to_ascii_lowercase();
+    let raw = if let Some(at) = lower.find("%userprofile%") {
+        format!("{}{profile}{}", &raw[..at], &raw[at + "%userprofile%".len()..])
+    } else {
+        raw.to_string()
+    };
+    expand_env(&raw)
+}
+
+fn open_key(root: HKEY, subkey: &str) -> Result<HKEY, ()> {
+    let mut key = HKEY::default();
+    let err = unsafe { RegOpenKeyExW(root, &HSTRING::from(subkey), None, KEY_READ, &mut key) };
+    if err == ERROR_FILE_NOT_FOUND {
+        return Err(());
+    }
+    err.ok().map(|_| key).map_err(|_| ())
+}
+
+fn reg_string(key: HKEY, subkey: &str, value: &str) -> Result<String, Missing> {
+    let mut buf = [0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    let err = unsafe {
+        RegGetValueW(
+            key,
+            &HSTRING::from(subkey),
+            &HSTRING::from(value),
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut len),
+        )
+    };
+    if err == ERROR_FILE_NOT_FOUND {
+        return Err(Missing::Gone);
+    }
+    if err.is_err() {
+        return Err(Missing::Failed);
+    }
+    let chars = (len as usize / 2).saturating_sub(1);
+    Ok(String::from_utf16_lossy(&buf[..chars.min(buf.len())]))
+}
+
+fn enable_restore() -> bool {
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut ok = true;
+        for name in [w!("SeBackupPrivilege"), w!("SeRestorePrivilege")] {
+            let mut luid = windows::Win32::Foundation::LUID::default();
+            if LookupPrivilegeValueW(None, name, &mut luid).is_err() {
+                ok = false;
+                break;
+            }
+            let tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [windows::Win32::Security::LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+            };
+            if AdjustTokenPrivileges(token, false, Some(std::ptr::from_ref(&tp)), 0, None, None).is_err() {
+                ok = false;
+                break;
+            }
+        }
+        let _ = CloseHandle(token);
+        ok
+    }
 }
 
 fn other_user_exes() -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(users_dir().unwrap_or_default()) else { return Vec::new() };
-    entries
-        .flatten()
-        .filter(|entry| !skip_profile(&entry.file_name().to_string_lossy()))
-        .map(|entry| entry.path().join(r"AppData\Local\Programs\Glass\bin\glass.exe"))
-        .filter(|path| path.is_file())
-        .collect()
-}
-
-fn users_dir() -> Option<PathBuf> {
-    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
-    Some(PathBuf::from(format!(r"{drive}\Users")))
-}
-
-fn skip_profile(name: &str) -> bool {
-    matches!(name, "Public" | "Default" | "Default User" | "All Users")
+    let Ok(found) = accounts() else { return Vec::new() };
+    found.into_iter().map(|account| account.local.join(r"Programs\Glass\bin\glass.exe")).filter(|path| path_present(path)).collect()
 }
 
 struct FirewallLock(HANDLE);
@@ -456,11 +659,18 @@ impl Drop for FirewallLock {
 
 fn lock_firewall() -> Result<FirewallLock, ()> {
     unsafe {
-        // Global is visible to the elevated helper and to SYSTEM during an MSI install.
-        // A non-elevated token cannot create it; Local still serializes this session.
-        let handle = CreateMutexW(None, false, w!("Global\\GlassFirewallReconcile"))
-            .or_else(|_| CreateMutexW(None, false, w!("Local\\GlassFirewallReconcile")))
-            .map_err(|_| ())?;
+        // Administrators and SYSTEM only. A Local fallback would let an elevated
+        // reconcile and this process run at the same time.
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(w!("D:P(A;;GA;;;SY)(A;;GA;;;BA)"), 1, &mut sd, None).map_err(|_| ())?;
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: false.into(),
+        };
+        let handle = CreateMutexW(Some(std::ptr::from_ref(&sa)), false, w!("Global\\GlassFirewallReconcile"));
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+        let handle = handle.map_err(|_| ())?;
         let wait = WaitForSingleObject(handle, 60_000);
         if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
             let _ = CloseHandle(handle);
@@ -522,6 +732,11 @@ fn read_rules_com() -> Result<Vec<FwRule>, ListFail> {
             };
             match read_one(&rule) {
                 Read::Rule(rule) => out.push(rule),
+                // Profiles or RemoteAddresses failed. Keep it so an owned allow is retired.
+                Read::Partial(rule) => {
+                    incomplete = true;
+                    out.push(rule);
+                }
                 Read::Skip => {}
                 Read::Failed => incomplete = true,
             }
@@ -532,6 +747,8 @@ fn read_rules_com() -> Result<Vec<FwRule>, ListFail> {
 
 enum Read {
     Rule(FwRule),
+    /// Identifiable, but Profiles or RemoteAddresses could not be read.
+    Partial(FwRule),
     /// Not an allow or a block. It is not one of ours and not a hole in the list.
     Skip,
     Failed,
@@ -554,8 +771,24 @@ fn read_one(rule: &INetFwRule) -> Read {
         } else {
             return Read::Skip;
         };
-        let Some(profiles) = rule.Profiles().ok() else { return Read::Failed };
-        let Some(remote_addresses) = bstr(rule.RemoteAddresses()) else { return Read::Failed };
+        let mut partial = false;
+        let profiles = match rule.Profiles() {
+            Ok(profiles) => profiles,
+            Err(_) => {
+                partial = true;
+                -1
+            }
+        };
+        let remote_addresses = match bstr(rule.RemoteAddresses()) {
+            Some(remote) => remote,
+            None => {
+                partial = true;
+                REMOTE_UNREADABLE.to_string()
+            }
+        };
+        // A missing grouping is a historical rule. Failing the whole list on that
+        // read would refuse every reconcile, because other programs' rules are in it.
+        let grouping = bstr(rule.Grouping()).unwrap_or_default();
         let edge = edge_of(rule);
         let protocol = rule.Protocol();
         let protocol_any = protocol.is_err() || protocol.as_ref().is_ok_and(|protocol| *protocol == NET_FW_IP_PROTOCOL_ANY.0);
@@ -574,15 +807,16 @@ fn read_one(rule: &INetFwRule) -> Read {
             protocol_any,
             ports_any,
             local_addresses_any,
+            grouping,
         };
         seen.id = fingerprint(&seen);
-        Read::Rule(seen)
+        if partial { Read::Partial(seen) } else { Read::Rule(seen) }
     }
 }
 
 fn fingerprint(rule: &FwRule) -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         rule.name,
         rule.program,
         rule.enabled as u8,
@@ -593,7 +827,8 @@ fn fingerprint(rule: &FwRule) -> String {
         edge_code(rule.edge),
         rule.protocol_any as u8,
         rule.ports_any as u8,
-        rule.local_addresses_any as u8
+        rule.local_addresses_any as u8,
+        rule.grouping
     )
 }
 
@@ -663,10 +898,17 @@ fn expand_env(text: &str) -> String {
 }
 
 fn add_rule(program: &str, spec: AllowSpec) -> Result<(), String> {
+    add_rule_grouped(program, spec, true)
+}
+
+fn add_rule_grouped(program: &str, spec: AllowSpec, grouping: bool) -> Result<(), String> {
     with_com(|| unsafe {
         let policy: INetFwPolicy2 = CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER).map_err(|error| error.to_string())?;
         let rule: INetFwRule2 = CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER).map_err(|error| error.to_string())?;
         rule.SetName(&BSTR::from(RULE_NAME)).map_err(|error| format!("name: {error}"))?;
+        if grouping {
+            rule.SetGrouping(&BSTR::from(GROUPING)).map_err(|error| format!("grouping: {error}"))?;
+        }
         rule.SetApplicationName(&BSTR::from(program)).map_err(|error| format!("application: {error}"))?;
         rule.SetEnabled(VARIANT_TRUE).map_err(|error| format!("enabled: {error}"))?;
         rule.SetDirection(NET_FW_RULE_DIR_IN).map_err(|error| format!("direction: {error}"))?;
@@ -699,19 +941,41 @@ fn retire(id: &str, allows_only: bool) -> Result<(), String> {
         if allows_only && rule.Action().map_err(|error| error.to_string())? != NET_FW_ACTION_ALLOW {
             return Err("refusing to delete a block rule".into());
         }
-        // Disable first. A crash between this and Remove leaves no wide allow in force.
-        let _ = rule.SetEnabled(VARIANT_FALSE);
-        let unique = BSTR::from(format!("Glass-{}", RETIRE_SEQ.fetch_add(1, Ordering::Relaxed)));
-        rule.SetName(&unique).map_err(|error| format!("couldn't rename the Glass rule ({error})"))?;
-        rules.Remove(&unique).map_err(|error| {
+        // The marker has to stick before the name changes, or a crash after the rename
+        // leaves an enabled rule that the next pass cannot recognize.
+        rule.SetGrouping(&BSTR::from(GROUPING)).map_err(|error| {
+            format!("couldn't mark the Glass rule ({error}). It was left named {RULE_NAME}.")
+        })?;
+        rule.SetEnabled(VARIANT_FALSE).map_err(|error| {
+            format!("couldn't disable the Glass rule ({error}). It was left named {RULE_NAME}.")
+        })?;
+        let enabled = rule.Enabled().map_err(|error| {
+            format!("couldn't confirm the Glass rule was disabled ({error}). It was left named {RULE_NAME}.")
+        })?;
+        if enabled.as_bool() {
+            return Err(format!("couldn't disable the Glass rule (it stayed enabled). It was left named {RULE_NAME}."));
+        }
+        let unique = retirement_name();
+        let unique_bstr = BSTR::from(&unique);
+        rule.SetName(&unique_bstr).map_err(|error| {
+            format!("couldn't rename the Glass rule ({error}). It was disabled, so it no longer allows traffic.")
+        })?;
+        rules.Remove(&unique_bstr).map_err(|error| {
             format!("couldn't delete the Glass rule ({error}). It was disabled, so it no longer allows traffic.")
         })
     })
 }
 
+fn retirement_name() -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let seq = RETIRE_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("Glass-{}-{nanos}-{seq}", std::process::id())
+}
+
 fn find_rule(rules: &INetFwRules, id: &str) -> Result<INetFwRule, String> {
     unsafe {
         let list: IEnumVARIANT = rules._NewEnum().map_err(|error| error.to_string())?.cast().map_err(|error| error.to_string())?;
+        let mut fallback = Vec::new();
         loop {
             let mut values = [VARIANT::default()];
             let mut got = 0u32;
@@ -725,14 +989,81 @@ fn find_rule(rules: &INetFwRules, id: &str) -> Result<INetFwRule, String> {
             let disp: Option<IDispatch> = if inner.vt == VT_DISPATCH { (*inner.Anonymous.pdispVal).clone() } else { None };
             let _ = VariantClear(&mut values[0]);
             let Some(rule) = disp.and_then(|disp| disp.cast::<INetFwRule>().ok()) else { continue };
-            if let Read::Rule(seen) = read_one(&rule)
-                && seen.id == id
-            {
+            let seen = match read_one(&rule) {
+                Read::Rule(seen) | Read::Partial(seen) => seen,
+                Read::Skip | Read::Failed => continue,
+            };
+            if seen.id == id {
                 return Ok(rule);
             }
+            // The first read stored a sentinel. The second read may now have the real
+            // remote addresses, so the fingerprint no longer matches.
+            if same_partial(id, &seen) {
+                fallback.push((rule, seen));
+            }
         }
-        Err("the Glass rule was no longer there".into())
+        pick_fallback(fallback).ok_or_else(|| "the Glass rule was no longer there".into())
     }
+}
+
+/// The sought id came from a partial read. Match another owned allow for that program
+/// whose other fields still agree, ignoring the fields that were unreadable.
+fn same_partial(sought: &str, seen: &FwRule) -> bool {
+    if !owned_allow(seen) {
+        return false;
+    }
+    let sought_lines: Vec<&str> = sought.split('\n').collect();
+    let live: Vec<&str> = seen.id.split('\n').collect();
+    if sought_lines.len() != 12 || live.len() != 12 {
+        return false;
+    }
+    let remote_partial = sought_lines[6] == REMOTE_UNREADABLE;
+    let profiles_partial = sought_lines[5] == "-1";
+    if !remote_partial && !profiles_partial {
+        return false;
+    }
+    for i in 0..12 {
+        if i == 2 {
+            continue;
+        }
+        if i == 5 && profiles_partial {
+            continue;
+        }
+        if i == 6 && remote_partial {
+            continue;
+        }
+        if i == 11 && sought_lines[11].is_empty() {
+            continue;
+        }
+        if sought_lines[i] != live[i] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Prefer a rule that is still only partly readable. Otherwise prefer one that is not
+/// an exact Tailscale allow, so a keeper is not the one removed when several match.
+fn pick_fallback(mut candidates: Vec<(INetFwRule, FwRule)>) -> Option<INetFwRule> {
+    if let Some(index) = candidates.iter().position(|(_, seen)| seen.remote_addresses == REMOTE_UNREADABLE || seen.profiles < 0) {
+        return Some(candidates.swap_remove(index).0);
+    }
+    if let Some(index) = candidates.iter().position(|(_, seen)| !remote_looks_tailscale(&seen.remote_addresses)) {
+        return Some(candidates.swap_remove(index).0);
+    }
+    candidates.into_iter().next().map(|(rule, _)| rule)
+}
+
+fn remote_looks_tailscale(raw: &str) -> bool {
+    let raw = raw.trim().to_ascii_lowercase();
+    !raw.is_empty()
+        && !raw.contains('*')
+        && !raw.contains("unreadable")
+        && raw.split(',').all(|part| {
+            let part = part.trim();
+            part.is_empty() || part.contains("100.64.") || part.contains("fd7a:115c:a1e0")
+        })
+        && (raw.contains("100.64.") || raw.contains("fd7a:115c:a1e0"))
 }
 
 fn delete_glass_rules(program: &str) -> Result<(), String> {
@@ -789,28 +1120,52 @@ mod tests {
         // only the letters MZ is rejected with "The parameter is incorrect".
         let exe = std::env::current_exe().expect("test executable");
         let program = crate::browse::shell_path(&exe.display().to_string());
-        struct Guard(String);
+        let dir = std::env::temp_dir().join(format!("glass-fw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let copy = dir.join("glass-copy.exe");
+        std::fs::copy(&exe, &copy).expect("copy the test executable");
+        let second = crate::browse::shell_path(&copy.display().to_string());
+        struct Guard {
+            programs: Vec<String>,
+            dir: std::path::PathBuf,
+        }
         impl Drop for Guard {
             fn drop(&mut self) {
-                let _ = delete_glass_rules(&self.0);
+                for program in &self.programs {
+                    let _ = delete_glass_rules(program);
+                }
+                let _ = std::fs::remove_dir_all(&self.dir);
             }
         }
-        let _guard = Guard(program.clone());
+        let _guard = Guard { programs: vec![program.clone(), second.clone()], dir };
         let _ = delete_glass_rules(&program);
+        let _ = delete_glass_rules(&second);
+
+        // A historical rule has the display name and no Grouping. The second program
+        // gets a rule this build would create.
+        add_rule_grouped(&program, AllowSpec::Any, false).expect("create the historical wide rule");
+        let historical = glass_allows(&mut ComStore, &program);
+        assert_eq!(historical.len(), 1);
+        assert!(historical[0].grouping.is_empty(), "historical rules have no grouping");
 
         let mut store = ComStore;
-        store.add_allow(&program, AllowSpec::Any).expect("create the wide rule");
-        firewall_scope::reconcile(&mut store, &[program.as_str()], ScopePlan { scope: RemoteScope::Tailscale, allow_wide: false })
+        store.add_allow(&second, AllowSpec::Any).expect("create the second wide rule");
+        firewall_scope::reconcile(&mut store, &[program.as_str(), second.as_str()], ScopePlan { scope: RemoteScope::Tailscale })
             .expect("tailscale reconcile");
-        assert_only_tailscale(&mut store, &program);
+        assert_exact_tailscale(&mut store, &program);
+        assert_exact_tailscale(&mut store, &second);
 
-        firewall_scope::reconcile(&mut store, &[program.as_str()], ScopePlan { scope: RemoteScope::Loopback, allow_wide: false })
+        firewall_scope::reconcile(&mut store, &[program.as_str(), second.as_str()], ScopePlan { scope: RemoteScope::Loopback })
             .expect("loopback reconcile");
         assert!(glass_allows(&mut store, &program).is_empty(), "loopback keeps no Glass allow");
+        assert!(glass_allows(&mut store, &second).is_empty(), "loopback keeps no Glass allow");
 
-        firewall_scope::reconcile(&mut store, &[program.as_str()], ScopePlan { scope: RemoteScope::Any, allow_wide: true }).expect("wide reconcile");
+        firewall_scope::reconcile(&mut store, &[program.as_str()], ScopePlan { scope: RemoteScope::Any }).expect("wide reconcile");
         let allows = glass_allows(&mut store, &program);
         assert_eq!(allows.len(), 1, "one wide Glass allow");
+        assert!(allows[0].enabled && allows[0].inbound && allows[0].allow);
+        assert!(programs_match(&allows[0].program, &program));
+        assert_eq!(allows[0].profiles, PROFILE_PRIVATE);
         assert!(is_unrestricted(&allows[0].remote_addresses), "remote={}", allows[0].remote_addresses);
     }
 
@@ -819,24 +1174,24 @@ mod tests {
             .list()
             .expect("list rules")
             .into_iter()
-            .filter(|rule| rule.inbound && rule.allow && is_glass_name(&rule.name) && programs_match(&rule.program, program))
+            .filter(|rule| owned_allow(rule) && programs_match(&rule.program, program))
             .collect()
     }
 
-    fn assert_only_tailscale(store: &mut ComStore, program: &str) {
+    fn assert_exact_tailscale(store: &mut ComStore, program: &str) {
         let allows = glass_allows(store, program);
-        assert!(!allows.is_empty(), "a Tailscale allow should exist");
+        assert!(!allows.is_empty(), "a Tailscale allow should exist for {program}");
         for rule in &allows {
-            assert!(!is_unrestricted(&rule.remote_addresses), "wide remote {}", rule.remote_addresses);
-            let remote = rule.remote_addresses.to_lowercase();
-            assert!(
-                remote.contains("100.64.0.0") || remote.contains("fd7a:115c:a1e0"),
-                "remote {}",
-                rule.remote_addresses
-            );
+            assert!(rule.enabled, "enabled");
+            assert!(rule.inbound, "inbound");
+            assert!(rule.allow, "allow");
+            assert!(programs_match(&rule.program, program), "program {}", rule.program);
+            assert_eq!(rule.profiles, PROFILE_PRIVATE, "profile");
             assert_eq!(rule.edge, Edge::Deny, "edge {:?}", rule.edge);
-            assert_eq!(rule.profiles, PROFILE_PRIVATE);
+            assert_eq!(rule.grouping, GROUPING);
         }
+        let remotes: Vec<&str> = allows.iter().map(|rule| rule.remote_addresses.as_str()).collect();
+        assert!(firewall_scope::covers_tailscale_exactly(&remotes), "remotes {remotes:?}");
     }
 
     fn is_unrestricted(raw: &str) -> bool {

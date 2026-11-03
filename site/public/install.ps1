@@ -112,6 +112,23 @@ if ($service -and $serviceVersion -ne $version) {
     if ($LASTEXITCODE -ne 0) { Info 'Not updated: run  glass service install  to keep the lock screen working' }
 }
 
+# The firewall rule follows the saved bind. This is its own step: it runs when no
+# secure-desktop service is installed, and it runs before the early return below.
+# A fresh install still does this inside `glass setup`, so it is not asked twice.
+# Canceling the prompt or a failed cleanup stops the script, so it does not report success.
+if ($previous) {
+    Info 'Updating the Windows Firewall rule (Windows asks for permission)'
+    try {
+        $fw = Start-Process -FilePath $Glass -ArgumentList '--glass-firewall-sync' -Verb RunAs -Wait -PassThru
+    } catch {
+        Fail "The firewall rule was not updated. Run  glass setup  so a wider allow is not left behind. $_"
+    }
+    if (-not $fw -or $fw.ExitCode -ne 0) {
+        $code = if ($fw) { $fw.ExitCode } else { 'unknown' }
+        Fail "The firewall rule was not updated (exit $code). Run  glass setup  so a wider allow is not left behind."
+    }
+}
+
 # The app, in the Start menu (Glass.app on a Mac).
 $app = $false
 try { & $Glass app --install | Out-Null; $app = ($LASTEXITCODE -eq 0) } catch {}

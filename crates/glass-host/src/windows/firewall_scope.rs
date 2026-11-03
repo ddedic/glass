@@ -27,6 +27,8 @@ pub enum RemoteScope {
     /// Every listener is loopback. The firewall does not filter loopback, so Glass
     /// keeps no inbound allow rule of its own.
     Loopback,
+    /// A settings file or profile could not be read. Nothing owned is provably safe.
+    Unknown,
 }
 
 /// One snapshot of the saved bind. Passed through a reconcile so a concurrent edit
@@ -34,10 +36,14 @@ pub enum RemoteScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScopePlan {
     pub scope: RemoteScope,
-    /// When false, do not create or restore a wide allow. An installer that could not
-    /// read a profile uses this so an upgrade does not invent the old "any remote" rule.
-    pub allow_wide: bool,
 }
+
+/// `Grouping` on rules Glass creates. A retirement that is renamed still carries this,
+/// so a later pass can find the rule after the display name "Glass" is gone.
+pub const GROUPING: &str = "Glass";
+
+/// Stored when `RemoteAddresses` could not be read. Not a real scope, and not "any".
+pub const REMOTE_UNREADABLE: &str = "\u{1}unreadable";
 
 /// How a rule treats edge traversal. `DenyOrDefer` is the old boolean `false`, which
 /// covers both deny and defer-to-user; a remote-address list cannot be stored on defer-to-user.
@@ -77,6 +83,8 @@ pub struct FwRule {
     pub protocol_any: bool,
     pub ports_any: bool,
     pub local_addresses_any: bool,
+    /// Empty on a historical rule. [`GROUPING`] on a rule this build created or retired.
+    pub grouping: String,
 }
 
 /// A listing that did not see every rule. Callers must not treat it as success.
@@ -171,25 +179,42 @@ pub fn narrowest(scopes: impl IntoIterator<Item = RemoteScope>) -> RemoteScope {
     scopes
         .into_iter()
         .min_by_key(|scope| match scope {
-            RemoteScope::Loopback => 0,
-            RemoteScope::Tailscale => 1,
-            RemoteScope::Any => 2,
+            RemoteScope::Unknown => 0,
+            RemoteScope::Loopback => 1,
+            RemoteScope::Tailscale => 2,
+            RemoteScope::Any => 3,
         })
         .unwrap_or(RemoteScope::Any)
 }
 
-/// `binds` are the settings files that could be read. `unreadable` means another profile
-/// might exist and could not be read, so a wide rule must not be created or restored.
+/// Canonical tokens from [`crate::listen::parse_bind`]. A value the listener rejects is
+/// `Err`, not a wide rule: an unparseable saved bind must not open the network.
+pub fn scope_for_saved<S: AsRef<str>>(values: &[S]) -> Result<RemoteScope, ()> {
+    let tokens = crate::listen::parse_bind(values).map_err(|_| ())?;
+    Ok(scope_for_bind(&tokens))
+}
+
+/// `binds` are settings files that parsed. `unreadable` means a profile or file could
+/// not be read: the plan is [`RemoteScope::Unknown`], which removes owned allows and
+/// does not create a wide one.
 pub fn plan_from_binds(binds: &[Vec<String>], unreadable: bool) -> ScopePlan {
-    if binds.is_empty() {
-        return ScopePlan { scope: RemoteScope::Any, allow_wide: !unreadable };
+    if unreadable {
+        return ScopePlan { scope: RemoteScope::Unknown };
     }
-    let scope = narrowest(binds.iter().map(|bind| scope_for_bind(bind)));
-    ScopePlan { scope, allow_wide: scope == RemoteScope::Any && !unreadable }
+    if binds.is_empty() {
+        return ScopePlan { scope: RemoteScope::Any };
+    }
+    ScopePlan { scope: narrowest(binds.iter().map(|bind| scope_for_bind(bind))) }
 }
 
 pub fn is_glass_name(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case(RULE_NAME)
+}
+
+/// A rule Glass created, including one renamed during a retirement that still carries
+/// [`GROUPING`]. A block rule is not an allow, so it is not owned for removal by sync.
+pub fn owned_allow(rule: &FwRule) -> bool {
+    rule.inbound && rule.allow && (is_glass_name(&rule.name) || rule.grouping == GROUPING)
 }
 
 /// Case-insensitive path compare. Strips the `\\?\` prefix Windows adds.
@@ -331,11 +356,18 @@ pub fn reconcile(store: &mut impl FirewallStore, programs: &[impl AsRef<str>], p
             }
         }
     }
-    if errors.is_empty() {
-        Ok(Report { programs: reports })
-    } else {
-        Err(ReconcileError { message: errors.join("\n") })
+    if !errors.is_empty() {
+        return Err(ReconcileError { message: errors.join("\n") });
     }
+    if let Err(message) = read_back(store, programs, plan) {
+        return Err(ReconcileError { message });
+    }
+    if plan.scope == RemoteScope::Unknown {
+        return Err(ReconcileError {
+            message: "Couldn't read the saved bind. Glass allow rules were removed so a wider rule was not left behind. Run `glass setup` again.".into(),
+        });
+    }
+    Ok(Report { programs: reports })
 }
 
 /// Re-reads the plan after each pass. A bind edit during the write is applied again,
@@ -354,9 +386,15 @@ pub fn reconcile_stable(
         }
         plan = now;
     }
-    Err(ReconcileError {
-        message: "The saved bind changed while the firewall rule was updating. Run `glass setup` again.".into(),
-    })
+    // The loop observed a newer plan and did not apply it. Apply that one, then stop
+    // if the file is still changing.
+    let report = reconcile(store, programs, plan)?;
+    if load() != plan {
+        return Err(ReconcileError {
+            message: "The saved bind changed while the firewall rule was updating. Run `glass setup` again.".into(),
+        });
+    }
+    Ok(report)
 }
 
 fn recover_partial(
@@ -465,25 +503,21 @@ fn ops_for(rules: &[FwRule], program: &str, plan: ScopePlan) -> Ops {
             && affects_private(rule)
             && match plan.scope {
                 RemoteScope::Any => false,
-                RemoteScope::Loopback => true,
                 RemoteScope::Tailscale => !remote_within_tailscale(&rule.remote_addresses),
+                RemoteScope::Loopback | RemoteScope::Unknown => true,
             }
     });
     let allows: Vec<&FwRule> = mine.iter().copied().filter(|rule| owned_allow(rule)).collect();
     let has_glass_allow = allows.iter().any(|rule| rule.enabled);
     let (remove, add) = match plan.scope {
-        RemoteScope::Loopback => (allows.iter().map(|rule| rule.id.clone()).collect(), Vec::new()),
+        RemoteScope::Loopback | RemoteScope::Unknown => (allows.iter().map(|rule| rule.id.clone()).collect(), Vec::new()),
         RemoteScope::Tailscale => tailscale_ops(&allows),
-        RemoteScope::Any => any_ops(&allows, plan.allow_wide),
+        RemoteScope::Any => any_ops(&allows),
     };
     let removed: BTreeSet<&str> = remove.iter().map(String::as_str).collect();
     let kept_existing = allows.iter().any(|rule| rule.enabled && !removed.contains(rule.id.as_str()));
-    let keeps_allow = plan.scope != RemoteScope::Loopback && (kept_existing || !add.is_empty());
+    let keeps_allow = matches!(plan.scope, RemoteScope::Any | RemoteScope::Tailscale) && (kept_existing || !add.is_empty());
     Ops { remove, add, blocked, foreign_wider, has_glass_allow, keeps_allow }
-}
-
-fn owned_allow(rule: &FwRule) -> bool {
-    rule.inbound && rule.allow && is_glass_name(&rule.name)
 }
 
 fn affects_private(rule: &FwRule) -> bool {
@@ -495,7 +529,8 @@ fn shape_ok(rule: &FwRule) -> bool {
 }
 
 fn edge_blocks(rule: &FwRule) -> bool {
-    matches!(rule.edge, Edge::Deny | Edge::DenyOrDefer)
+    // The legacy boolean `false` is deny or defer-to-user. Only an explicit deny counts.
+    rule.edge == Edge::Deny
 }
 
 fn tailscale_ops(allows: &[&FwRule]) -> (Vec<String>, Vec<AllowSpec>) {
@@ -524,18 +559,8 @@ fn tailscale_ops(allows: &[&FwRule]) -> (Vec<String>, Vec<AllowSpec>) {
     (remove, add)
 }
 
-fn any_ops(allows: &[&FwRule], allow_wide: bool) -> (Vec<String>, Vec<AllowSpec>) {
+fn any_ops(allows: &[&FwRule]) -> (Vec<String>, Vec<AllowSpec>) {
     let wide: Vec<&FwRule> = allows.iter().copied().filter(|rule| shape_ok(rule) && remote_is_unrestricted(&rule.remote_addresses)).collect();
-    if !allow_wide {
-        // Don't restore the wide rule. If a narrower Glass allow is already there,
-        // a wide sibling is still exposure, so that sibling goes.
-        let restricted = allows.iter().any(|rule| rule.enabled && !remote_is_unrestricted(&rule.remote_addresses));
-        if !restricted {
-            return (Vec::new(), Vec::new());
-        }
-        let remove = allows.iter().filter(|rule| remote_is_unrestricted(&rule.remote_addresses)).map(|rule| rule.id.clone()).collect();
-        return (remove, Vec::new());
-    }
     let keep = wide.first().map(|rule| rule.id.as_str());
     let remove = allows.iter().filter(|rule| keep != Some(rule.id.as_str())).map(|rule| rule.id.clone()).collect();
     let add = if wide.is_empty() { vec![AllowSpec::Any] } else { Vec::new() };
@@ -544,6 +569,50 @@ fn any_ops(allows: &[&FwRule], allow_wide: bool) -> (Vec<String>, Vec<AllowSpec>
 
 fn tailscale_set() -> BTreeSet<String> {
     BTreeSet::from([TAILSCALE_V4.to_string(), TAILSCALE_V6.to_string()])
+}
+
+/// The union of `remotes` is exactly Tailscale's two ranges, with nothing else.
+pub fn covers_tailscale_exactly<S: AsRef<str>>(remotes: &[S]) -> bool {
+    let mut all = BTreeSet::new();
+    for remote in remotes {
+        match remote_class(remote.as_ref()) {
+            RemoteClass::Exact(cidrs) => all.extend(cidrs),
+            RemoteClass::Unrestricted | RemoteClass::Other => return false,
+        }
+    }
+    all == tailscale_set()
+}
+
+fn read_back(store: &mut impl FirewallStore, programs: &[impl AsRef<str>], plan: ScopePlan) -> Result<(), String> {
+    let rules = match store.list() {
+        Ok(rules) => rules,
+        Err(ListFail::Unavailable(message)) => return Err(format!("Couldn't read the firewall rule back ({message}).")),
+        Err(ListFail::Incomplete(_)) => {
+            return Err("Windows Firewall could not be listed completely after the update. Run `glass setup` again.".into());
+        }
+    };
+    for program in programs {
+        if !program_matches(&rules, program.as_ref(), plan) {
+            return Err(format!(
+                "{}: the firewall rule was read back and does not match the saved bind. Run `glass setup` again.",
+                program.as_ref()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn program_matches(rules: &[FwRule], program: &str, plan: ScopePlan) -> bool {
+    let allows: Vec<&FwRule> = rules.iter().filter(|rule| owned_allow(rule) && programs_match(&rule.program, program)).collect();
+    match plan.scope {
+        RemoteScope::Loopback | RemoteScope::Unknown => allows.is_empty(),
+        RemoteScope::Any => allows.len() == 1 && shape_ok(allows[0]) && remote_is_unrestricted(&allows[0].remote_addresses),
+        RemoteScope::Tailscale => {
+            !allows.is_empty()
+                && allows.iter().all(|rule| shape_ok(rule) && edge_blocks(rule))
+                && covers_tailscale_exactly(&allows.iter().map(|rule| rule.remote_addresses.as_str()).collect::<Vec<_>>())
+        }
+    }
 }
 
 fn remote_exact(rule: &FwRule) -> Option<BTreeSet<String>> {
@@ -700,6 +769,7 @@ mod tests {
             protocol_any: true,
             ports_any: true,
             local_addresses_any: true,
+            grouping: String::new(),
         }
     }
 
@@ -764,11 +834,15 @@ mod tests {
     }
 
     fn tailscale_plan() -> ScopePlan {
-        ScopePlan { scope: RemoteScope::Tailscale, allow_wide: false }
+        ScopePlan { scope: RemoteScope::Tailscale }
     }
 
-    fn wide_plan(allow_wide: bool) -> ScopePlan {
-        ScopePlan { scope: RemoteScope::Any, allow_wide }
+    fn wide_plan() -> ScopePlan {
+        ScopePlan { scope: RemoteScope::Any }
+    }
+
+    fn unknown_plan() -> ScopePlan {
+        ScopePlan { scope: RemoteScope::Unknown }
     }
 
     #[test]
@@ -779,16 +853,17 @@ mod tests {
         assert_eq!(scope_for_bind(&["192.168.1.5"]), RemoteScope::Any);
         assert_eq!(scope_for_bind(&["tailscale", "10.0.0.4"]), RemoteScope::Any);
         assert_eq!(scope_for_bind(&["not-an-address"]), RemoteScope::Any);
+        assert_eq!(scope_for_saved(&["tailscale,127.0.0.1"]), Ok(RemoteScope::Tailscale));
+        assert_eq!(scope_for_saved(&["not an address"]), Err(()));
         assert_eq!(scope_for_bind(&["Tailscale"]), RemoteScope::Tailscale);
         assert_eq!(scope_for_bind(&["100.64.0.7", "127.0.0.1"]), RemoteScope::Tailscale);
         assert_eq!(scope_for_bind(&["::ffff:100.64.0.7"]), RemoteScope::Tailscale);
         assert_eq!(scope_for_bind(&["fd7a:115c:a1e0::1"]), RemoteScope::Tailscale);
         assert_eq!(scope_for_bind(&["127.0.0.1", "::1"]), RemoteScope::Loopback);
         let mixed = plan_from_binds(&[vec!["tailscale".into()], vec!["0.0.0.0".into()]], false);
-        assert_eq!(mixed.scope, RemoteScope::Tailscale);
-        assert!(!mixed.allow_wide);
-        assert_eq!(plan_from_binds(&[], false), wide_plan(true));
-        assert_eq!(plan_from_binds(&[], true), wide_plan(false));
+        assert_eq!(mixed, tailscale_plan());
+        assert_eq!(plan_from_binds(&[], false), wide_plan());
+        assert_eq!(plan_from_binds(&[], true), unknown_plan());
         assert_eq!(plan_from_binds(&[vec!["127.0.0.1".into()], vec!["tailscale".into()]], false).scope, RemoteScope::Loopback);
     }
 
@@ -907,7 +982,7 @@ mod tests {
         let mut block = allow("block", "*", Edge::Deny);
         block.allow = false;
         let mut store = Mock::new(vec![allow("wide", "*", Edge::DeferToUser), block]);
-        let report = reconcile(&mut store, &[PROGRAM], ScopePlan { scope: RemoteScope::Loopback, allow_wide: false }).unwrap();
+        let report = reconcile(&mut store, &[PROGRAM], ScopePlan { scope: RemoteScope::Loopback }).unwrap();
         assert!(!report.programs[0].has_glass_allow);
         assert!(report.programs[0].blocked);
         assert!(store.glass_allows().is_empty());
@@ -915,20 +990,20 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_profile_does_not_restore_a_wide_rule() {
-        let mut store = Mock::new(vec![allow("tight", "100.64.0.0/10,fd7a:115c:a1e0::/48", Edge::Deny), allow("wide", "*", Edge::DeferToUser)]);
-        reconcile(&mut store, &[PROGRAM], wide_plan(false)).unwrap();
-        let remotes: Vec<_> = store.glass_allows().iter().map(|rule| rule.remote_addresses.as_str()).collect();
-        assert_eq!(remotes, vec!["100.64.0.0/10,fd7a:115c:a1e0::/48"]);
+    fn an_unreadable_profile_removes_owned_allows_and_is_not_success() {
         let mut lone = Mock::new(vec![allow("wide", "*", Edge::DeferToUser)]);
-        reconcile(&mut lone, &[PROGRAM], wide_plan(false)).unwrap();
-        assert_eq!(lone.glass_allows().len(), 1);
+        let error = reconcile(&mut lone, &[PROGRAM], unknown_plan()).unwrap_err();
+        assert!(error.message.contains("Couldn't read the saved bind"));
+        assert!(lone.glass_allows().is_empty());
+        let mut renamed = allow("retired", TAILSCALE_V4, Edge::Deny);
+        renamed.name = "Glass-retired".into();
+        renamed.grouping = GROUPING.into();
+        let mut marked = Mock::new(vec![renamed]);
+        let _ = reconcile(&mut marked, &[PROGRAM], unknown_plan()).unwrap_err();
+        assert!(marked.glass_allows().is_empty(), "a grouping marker is still owned after rename");
         let mut empty = Mock::new(vec![]);
-        reconcile(&mut empty, &[PROGRAM], wide_plan(true)).unwrap();
+        reconcile(&mut empty, &[PROGRAM], wide_plan()).unwrap();
         assert!(remote_is_unrestricted(&empty.glass_allows()[0].remote_addresses));
-        reconcile(&mut store, &[PROGRAM], wide_plan(true)).unwrap();
-        assert!(store.glass_allows().iter().any(|rule| remote_is_unrestricted(&rule.remote_addresses)));
-        assert!(store.glass_allows().iter().all(|rule| remote_is_unrestricted(&rule.remote_addresses)));
     }
 
     #[test]
@@ -937,7 +1012,7 @@ mod tests {
         let mut reads = 0;
         reconcile_stable(&mut store, &[PROGRAM], || {
             reads += 1;
-            if reads == 1 { wide_plan(true) } else { tailscale_plan() }
+            if reads == 1 { wide_plan() } else { tailscale_plan() }
         })
         .unwrap();
         assert!(store.glass_allows().iter().all(|rule| remote_within_tailscale(&rule.remote_addresses)));
@@ -952,5 +1027,18 @@ mod tests {
         let report = reconcile(&mut store, &[PROGRAM], tailscale_plan()).unwrap();
         assert!(!report.programs[0].foreign_wider);
         assert!(store.rules.iter().any(|rule| rule.id == "foreign"));
+    }
+
+    #[test]
+    fn an_uncertain_edge_and_an_unreadable_remote_are_not_kept() {
+        let mut store = Mock::new(vec![allow("defer", "100.64.0.0/10,fd7a:115c:a1e0::/48", Edge::DenyOrDefer)]);
+        reconcile(&mut store, &[PROGRAM], tailscale_plan()).unwrap();
+        assert!(store.glass_allows().iter().all(|rule| rule.edge == Edge::Deny));
+        assert!(covers_tailscale_exactly(&store.glass_allows().iter().map(|rule| rule.remote_addresses.as_str()).collect::<Vec<_>>()));
+        let mut partial = Mock::new(vec![allow("seen", REMOTE_UNREADABLE, Edge::Deny)]);
+        partial.incomplete = true;
+        let error = reconcile(&mut partial, &[PROGRAM], tailscale_plan()).unwrap_err();
+        assert!(error.message.contains("listed completely"));
+        assert!(partial.glass_allows().is_empty());
     }
 }

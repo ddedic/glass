@@ -77,6 +77,8 @@ pub async fn fetch_latest() -> Option<String> {
 }
 
 /// The installer: install.sh through sh, or install.ps1 through PowerShell on Windows.
+/// On Windows an update runs `glass --glass-firewall-sync` and the script stops if that
+/// does not succeed, so this command fails too and does not report the migration done.
 fn installer() -> std::process::Command {
     #[cfg(windows)]
     let mut cmd = {

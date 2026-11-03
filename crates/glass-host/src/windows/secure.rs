@@ -590,7 +590,7 @@ fn create_pipe(sd: &SecurityDescriptor) -> anyhow::Result<Pipe> {
 }
 
 /// The SID string of the user signed in at the active console session, if any.
-fn console_user_sid() -> Option<String> {
+pub(crate) fn console_user_sid() -> Option<String> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     // SAFETY: the token is closed before returning.

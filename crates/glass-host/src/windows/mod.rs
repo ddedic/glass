@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod audio;
+pub mod auto_update;
 pub mod clipboard;
 pub mod clock;
 pub mod convert;

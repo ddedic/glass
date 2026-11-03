@@ -29,7 +29,7 @@
       <string id="Terminal">Allow the terminal</string>
       <string id="Terminal_Explain">Disabled: the user's own devices can't open a terminal on this computer from the viewer (guests never can). Enabled or not configured: they can. Computer Configuration wins over User Configuration.</string>
       <string id="Updates">Allow updates</string>
-      <string id="Updates_Explain">Disabled: Glass doesn't check for updates or update itself; deploy new versions with the MSI (or winget). Enabled or not configured: it checks, and users can update. Glass installed for all users with the MSI is always updated by an administrator. Computer Configuration wins over User Configuration.</string>
+      <string id="Updates_Explain">Disabled: Glass doesn't check for updates or update itself; deploy new versions with the MSI (or winget). Enabled or not configured: it checks, and users can update. Glass installed for everyone (the MSI) is updated by the secure-desktop service, with no prompt, unless this policy is disabled. Computer Configuration wins over User Configuration.</string>
     </stringTable>
     <presentationTable>
       <presentation id="Relay">

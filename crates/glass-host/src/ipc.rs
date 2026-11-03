@@ -50,10 +50,37 @@ pub fn path() -> PathBuf {
 /// One pipe per user (and per config dir, so tests and `glass support` get their own).
 #[cfg(windows)]
 pub fn path() -> PathBuf {
-    let dir = crate::config_dir().to_string_lossy().to_lowercase();
+    PathBuf::from(pipe_name_for(&crate::config_dir()))
+}
+
+/// The pipe a host with this config directory listens on.
+#[cfg(windows)]
+pub(crate) fn pipe_name_for(config_dir: &std::path::Path) -> String {
+    let dir = config_dir.to_string_lossy().to_lowercase();
     let digest = ring::digest::digest(&ring::digest::SHA256, dir.as_bytes());
     let tag: String = digest.as_ref()[..8].iter().map(|b| format!("{b:02x}")).collect();
-    PathBuf::from(format!(r"\\.\pipe\glass-{tag}"))
+    format!(r"\\.\pipe\glass-{tag}")
+}
+
+/// How many viewers that host reports. `Ok(None)` means it is not running.
+#[cfg(windows)]
+pub(crate) fn viewer_count(config_dir: &std::path::Path) -> Result<Option<usize>> {
+    use std::io::{BufRead, Write};
+    let mut stream = match std::fs::OpenOptions::new().read(true).write(true).open(pipe_name_for(config_dir)) {
+        Ok(stream) => stream,
+        Err(e) if e.raw_os_error() == Some(2) || e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("open the host pipe"),
+    };
+    let mut line = serde_json::to_string(&Request::Viewers)?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())?;
+    let mut reply = String::new();
+    std::io::BufReader::new(&stream).read_line(&mut reply)?;
+    let value: serde_json::Value = serde_json::from_str(&reply).context("no reply from Glass")?;
+    if let Some(e) = value.get("error").and_then(|e| e.as_str()) {
+        anyhow::bail!("{e}");
+    }
+    value["viewers"].as_array().map(|v| v.len()).context("no viewers in the reply").map(Some)
 }
 
 /// Serves requests until the host exits.

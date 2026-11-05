@@ -384,6 +384,11 @@ const ui = createUI({
     input.setPcKeyboard(on);
     log('info', `pc keyboard ${on ? 'on' : 'off'}`);
   },
+  onPhysicalKeyboard: (on) => {
+    keyboard.physical = on;
+    saveKeyboard();
+    input.setPhysicalKeyboard(on);
+  },
   onCtrlAsCmd: (on) => {
     storage((s) => s.setItem(CTRL_AS_CMD_KEY, on ? '1' : '0'));
     keyboard.ctrlAsCmd = on;
@@ -478,7 +483,7 @@ function portUrl(port) {
 }
 
 // This machine's keyboard remaps (each machine keeps its own).
-let keyboard = { pc: pcKeyboard, ctrlAsCmd, swap: storage((s) => s.getItem(SWAP_KEY)) === '1' };
+let keyboard = { pc: pcKeyboard, ctrlAsCmd, swap: storage((s) => s.getItem(SWAP_KEY)) === '1', physical: false };
 // Keyed by host and port, so two Glass hosts on one name (tests, or several on a box) differ.
 const profileId = () => (currentHost.includes(':') ? currentHost : `${currentHost}:${config.wtPort}`);
 function saveKeyboard() {
@@ -486,10 +491,11 @@ function saveKeyboard() {
 }
 function applyKeyboard(hostOs) {
   const p = storage((s) => loadProfile((k) => s.getItem(k), profileId(), { fallback: keyboard, hostOs, isPC })) ?? keyboard;
-  keyboard = { pc: p.pc, ctrlAsCmd: p.ctrlAsCmd, swap: p.swap };
+  keyboard = { pc: p.pc, ctrlAsCmd: p.ctrlAsCmd, swap: p.swap, physical: p.physical };
   input.setPcKeyboard(keyboard.pc);
   input.setCtrlAsCmd(keyboard.ctrlAsCmd);
   input.setSwapCmdOption(keyboard.swap);
+  input.setPhysicalKeyboard(keyboard.physical);
   ui.setKeyboardProfile(keyboard);
 }
 

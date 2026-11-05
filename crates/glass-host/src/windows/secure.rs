@@ -201,6 +201,25 @@ pub fn send_input(ev: &Ev) -> bool {
     send(OP_INPUT, &ev.write())
 }
 
+/// Text uses the same input opcodes as keys. Write every chunk under one pipe lock so
+/// another command cannot land between a piece's chunks.
+pub fn type_text(text: &str) -> bool {
+    let packet = text_packet(text);
+    match packet.split_first() {
+        Some((&op, payload)) => send(op, payload),
+        None => true,
+    }
+}
+
+fn text_packet(text: &str) -> Vec<u8> {
+    let mut packet = Vec::new();
+    for ev in glass_proto::text_events(text) {
+        packet.push(OP_INPUT);
+        packet.extend_from_slice(&ev.write());
+    }
+    packet
+}
+
 pub fn move_abs(x: i32, y: i32) -> bool {
     let mut p = [0u8; 8];
     p[0..4].copy_from_slice(&x.to_le_bytes());
@@ -433,14 +452,24 @@ fn write_frame(writer: &Mutex<Arc<Pipe>>, frame: &EncodedFrame) -> bool {
 /// The injection thread: keeps itself on the input desktop (which changes when the lock
 /// screen or a UAC prompt appears) and injects what the host sends.
 fn inject_loop(rx: std::sync::mpsc::Receiver<InputCmd>) {
+    use crate::media::InputSink;
     // Stream 0 is the helper's main-display capture, which is what viewers see while locked.
     let mut injector = super::input::Injector::new(0);
+    let mut text = glass_proto::TextReader::default();
     while let Ok(cmd) = rx.recv() {
         retarget_input_desktop();
         match cmd {
+            InputCmd::Event(ev @ Ev::Text { .. }) => {
+                if let Some(text) = text.push(&ev) {
+                    injector.type_text(&text);
+                }
+            }
             InputCmd::Event(ev) => injector.handle(ev),
             InputCmd::MoveAbs(x, y) => injector.move_abs(x, y),
-            InputCmd::Release => injector.release_all(),
+            InputCmd::Release => {
+                text = glass_proto::TextReader::default();
+                injector.release_all();
+            }
         }
     }
     injector.release_all();
@@ -727,6 +756,23 @@ fn token_user_sid(token: windows::Win32::Foundation::HANDLE) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn helper_text_packets_reassemble_unicode_in_order() {
+        let packet = super::text_packet("@č\u{1f600}@č\u{1f600}");
+        assert!(packet.len() > 1 + glass_proto::INPUT_EVENT_LEN);
+        let mut reader = glass_proto::TextReader::default();
+        let mut result = Vec::new();
+        for record in packet.chunks_exact(1 + glass_proto::INPUT_EVENT_LEN) {
+            assert_eq!(record[0], super::OP_INPUT);
+            let event = glass_proto::InputEvent::read(record[1..].try_into().unwrap()).unwrap();
+            if let Some(text) = reader.push(&event) {
+                result.push(text);
+            }
+        }
+        assert_eq!(result, ["@č\u{1f600}@č\u{1f600}"]);
+        assert!(super::text_packet("").is_empty());
+    }
+
     #[test]
     fn the_handshake_names_this_version() {
         let h = super::handshake();

@@ -352,8 +352,9 @@ test.describe('input', () => {
     expect((await host.input('scroll')).events.reduce((sum, e) => sum + e.dy, 0)).toBeCloseTo(120 * 640 / shown, 0);
   });
 
-  it('sends typed keys as Mac keycodes', async ({ page, host }) => {
+  it('physical keyboard mode sends typed keys as Mac keycodes', async ({ page, host }) => {
     await open(page, host);
+    await pickMenuItem(page, 'btn-more', 'Physical keyboard');
     await host.clearInput();
     // Like a real keyboard: Shift is its own key press.
     await page.keyboard.press('Shift+KeyH');
@@ -373,12 +374,13 @@ test.describe('input', () => {
       sink.dispatchEvent(new CompositionEvent('compositionstart', { data: '' }));
       sink.dispatchEvent(new CompositionEvent('compositionend', { data: '日本語' }));
     });
-    // Plain ASCII still goes as keys.
+    // ASCII uses the same text path; editing keys remain physical.
     await page.keyboard.insertText('i');
-    await expect.poll(() => keys(host, 'keyup')).toEqual([K.I]);
+    await page.keyboard.press('Tab');
+    await expect.poll(() => keys(host, 'keyup')).toEqual([K.Tab]);
     const { events } = await host.input();
     const typed = events.filter((e) => e.t === 'text' || e.t === 'keydown').map((e) => e.text ?? e.keycode);
-    expect(typed).toEqual(['café 👍', '日本語', K.I]);
+    expect(typed).toEqual(['café 👍', '日本語', 'i', K.Tab]);
   });
 
   it('PC keyboard mode turns Ctrl into ⌘ and Super into Ctrl', async ({ page, host }) => {
@@ -526,15 +528,15 @@ test.describe('input', () => {
     expect(await page.locator('#screens').evaluate((el) => el.style.transform)).toBe('');
   });
 
-  it('on-screen keyboard text becomes key taps', async ({ page, host }) => {
+  it('on-screen keyboard text stays text and deletion becomes a key tap', async ({ page, host }) => {
     await open(page, host);
     await host.clearInput();
     await page.locator('#keys').evaluate((el) => {
       el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: 'a!', bubbles: true, cancelable: true }));
       el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'deleteContentBackward', bubbles: true, cancelable: true }));
     });
-    // a, then ! = Shift+1, then Backspace.
-    await expect.poll(() => keys(host, 'keydown')).toEqual([K.A, K.Shift, 0x12, 0x33]);
+    await expect.poll(() => keys(host, 'keydown')).toEqual([0x33]);
+    expect((await host.input('text')).events.map((e) => e.text)).toEqual(['a!']);
   });
 });
 
@@ -554,7 +556,13 @@ test.describe('clipboard and files', () => {
     expect((await host.input()).pastes).toBe(1);
   });
 
-  it('focuses the hidden key field while ⌘ is down, so Safari fires paste', async ({ page, host }) => {
+  it('temporarily focuses the hidden key field for paste on iPad', async ({ page, host }) => {
+    await page.addInitScript(() => {
+      // iPadOS uses a desktop Mac UA; unlike desktop browsers, screen clicks must not
+      // focus the sink because that would exit fullscreen and summon the keyboard.
+      Object.defineProperty(navigator, 'userAgent', { value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15 Safari/605.1.15' });
+      Object.defineProperty(navigator, 'maxTouchPoints', { value: 5 });
+    });
     await open(page, host);
     await page.locator('#screens').click();
     expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('keys');
@@ -747,8 +755,8 @@ test.describe('machines', () => {
       await host.clearInput();
       await other.clearInput();
       await page.keyboard.press('a');
-      await expect.poll(async () => (await other.input('keydown')).events.length).toBe(1);
-      expect((await host.input('keydown')).events).toHaveLength(0);
+      await expect.poll(async () => (await other.input('text')).events.map((e) => e.text)).toEqual(['a']);
+      expect((await host.input('text')).events).toHaveLength(0);
 
       // A machine that never answers: back home after a few tries or a timeout.
       await page.evaluate(() => localStorage.setItem('glass.machine', 'localhost:1'));

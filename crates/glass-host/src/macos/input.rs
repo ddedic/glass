@@ -229,8 +229,9 @@ impl Injector {
     /// Types `text` whatever the keyboard layout: key events carrying the characters
     /// themselves, a few at a time (apps drop longer strings per event).
     pub fn type_text(&mut self, text: &str) {
-        let units: Vec<u16> = text.encode_utf16().collect();
-        for chunk in units.chunks(16) {
+        let flags = self.flags;
+        self.flags = CGEventFlags(0);
+        for chunk in unicode_chunks(text) {
             for down in [true, false] {
                 let ev = CGEvent::new_keyboard_event(self.source.as_deref(), 0, down);
                 // SAFETY: `chunk` outlives the call, and its length is passed with it.
@@ -239,6 +240,7 @@ impl Injector {
             }
             std::thread::sleep(std::time::Duration::from_millis(4));
         }
+        self.flags = flags;
     }
 
     /// Pastes the clipboard: Cmd+V, using the Cmd the client is already holding.
@@ -347,6 +349,22 @@ impl Injector {
     }
 }
 
+/// CGEvent strings are short, but a UTF-16 surrogate pair must stay in one event.
+fn unicode_chunks(text: &str) -> Vec<Vec<u16>> {
+    let mut chunks = Vec::new();
+    let mut chunk = Vec::new();
+    for ch in text.chars() {
+        if chunk.len() + ch.len_utf16() > 16 {
+            chunks.push(std::mem::take(&mut chunk));
+        }
+        chunk.extend_from_slice(ch.encode_utf16(&mut [0; 2]));
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
 /// A point given as 0..1 of a stream, in global desktop points within `b` (a display,
 /// or a streamed window).
 fn to_global(b: CGRect, x: f32, y: f32) -> CGPoint {
@@ -431,6 +449,14 @@ impl crate::media::InputSink for Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_chunks_never_split_a_surrogate_pair() {
+        let chunks = unicode_chunks("123456789012345😀x");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(String::from_utf16(&chunks[0]).unwrap(), "123456789012345");
+        assert_eq!(String::from_utf16(&chunks[1]).unwrap(), "😀x");
+    }
 
     #[test]
     fn window_coordinates_land_inside_the_window() {

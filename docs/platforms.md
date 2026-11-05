@@ -31,7 +31,7 @@ Windows shipped in 0.13.0 (beta); a ✅ there means it ran in a Windows 11 Arm V
 
 | Feature | macOS | Linux | Windows | Notes |
 |---|---|---|---|---|
-| Mouse, keyboard, scroll | ✅ CGEvent | ✅ uinput | ✅ SendInput | Windows: keys by scan code |
+| Mouse, keyboard, scroll | ✅ CGEvent | ✅ uinput | ✅ SendInput | Windows/macOS: viewer text, physical shortcuts; More → Physical keyboard for games/host layout. Linux: physical keys. |
 | Relative mouse (games) | ✅ | ✅ | 🧪 | |
 | Type any text (agents) | ✅ | ❌ | ✅ layout keys, Unicode for the rest | Accents, symbols, CJK |
 | Pen pressure and tilt | ✅ | ❌ | 🧪 synthetic pen | |

@@ -97,7 +97,7 @@ fn foreground_layout() -> HKL {
 }
 
 /// The key that types `unit` on `layout`, and whether it needs Shift. Characters that need
-/// Ctrl or AltGr, or aren't on the layout, have none.
+/// Ctrl or AltGr, aren't on the layout, or change under Caps Lock, have none.
 fn layout_key(unit: u16, layout: HKL) -> Option<(u16, bool)> {
     // SAFETY: a plain lookup.
     let scan = unsafe { VkKeyScanExW(unit, layout) };
@@ -111,16 +111,23 @@ fn layout_key(unit: u16, layout: HKL) -> Option<(u16, bool)> {
     let shift = mods & 1 != 0;
     // It has to type exactly this: a layout without "Ü" offers plain U for it.
     let mut state = [0u8; 256];
-    if shift {
-        state[0x10] = 0x80; // VK_SHIFT
+    state[0x10] = if shift { 0x80 } else { 0 }; // VK_SHIFT
+    // This injection thread does not consume the foreground app's keyboard messages:
+    // GetKeyState can report stale Caps Lock state here. Only synthesize layout keys
+    // whose result is exact in BOTH states; case-sensitive characters use Unicode.
+    for caps in [0, 1] {
+        state[0x14] = caps;
+        let mut out = [0u16; 4];
+        // SAFETY: buffers sized as given; flag 4 leaves the keyboard's dead-key state alone.
+        let n = unsafe {
+            let code = MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, Some(layout));
+            ToUnicodeEx(vk as u32, code, &state, &mut out, 4, Some(layout))
+        };
+        if n != 1 || out[0] != unit {
+            return None;
+        }
     }
-    let mut out = [0u16; 4];
-    // SAFETY: buffers sized as given; flag 4 leaves the keyboard's dead-key state alone.
-    let n = unsafe {
-        let code = MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, Some(layout));
-        ToUnicodeEx(vk as u32, code, &state, &mut out, 4, Some(layout))
-    };
-    (n == 1 && out[0] == unit).then_some((vk, shift))
+    Some((vk, shift))
 }
 
 /// Presses and lets go of the key `vk` (with Shift if asked), held long enough to type.
@@ -282,7 +289,7 @@ impl Injector {
         }
     }
 
-    pub fn handle(&mut self, ev: Ev) {
+    fn sync_routing(&mut self) {
         // While the secure desktop is up (or an elevated window has focus), this process's
         // SendInput is refused; the SYSTEM helper injects for us. Release what the side we're
         // leaving still holds, so nothing stays stuck down across the switch.
@@ -295,6 +302,10 @@ impl Injector {
             }
             self.routing = want_route;
         }
+    }
+
+    pub fn handle(&mut self, ev: Ev) {
+        self.sync_routing();
         if self.routing {
             match ev {
                 Ev::MouseMove { x, y, stream } => {
@@ -485,7 +496,10 @@ impl Injector {
         }
         for button in 0..3u8 {
             if self.buttons[button as usize] {
-                self.handle(Ev::MouseUp { button });
+                // Do not re-enter handle(): this may be called while switching desktops.
+                let flag = [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTUP][button as usize];
+                send(&[mouse(0, 0, 0, flag)]);
+                self.buttons[button as usize] = false;
             }
         }
         let keys: Vec<INPUT> = std::mem::take(&mut self.held).into_iter().map(|k| keyboard(k, false)).collect();
@@ -639,15 +653,32 @@ impl crate::media::InputSink for Injector {
             self.move_in(r, x, y);
         }
     }
-    /// Any text: each character the keyboard layout has, typed as its key (with Shift if
-    /// it needs it), and others as Unicode key events. Apps read a Unicode key's character
+    /// Any text: layout keys only where Caps Lock cannot change the result (with Shift if
+    /// needed), and other characters as Unicode key events. Apps read a Unicode key's character
     /// when they get round to it, and a burst of them sent at once came out as the last
     /// character over and over (Notepad, in the VM); real keys always type what they are.
     fn type_text(&mut self, text: &str) -> bool {
-        // On the secure desktop (e.g. typing a password at the lock screen) injection goes
-        // through the helper, which has no Unicode path; let the caller press keys instead.
-        if super::secure::route_input() {
-            return false;
+        self.sync_routing();
+        // Text follows keys onto the helper's injection thread, including elevated windows.
+        if self.routing {
+            if !super::secure::type_text(text) {
+                tracing::debug!("input: helper disconnected while sending text");
+            }
+            // A transport failure must not retry as US-layout keys in a different window.
+            return true;
+        }
+        super::secure::follow_input_desktop();
+        // Viewer text is already resolved, even if an earlier physical chord or another
+        // viewer left modifiers down. Restore our logical held state after this insertion.
+        let modifiers: Vec<Key> = self.held.iter().copied().filter(|k| is_modifier(*k)).collect();
+        let menu_modifier = modifiers.iter().any(|k| matches!(*k, LEFT_WIN | RIGHT_WIN | Key::Scan(0x38, _)));
+        if menu_modifier {
+            send(&[keyboard(MASK, true), keyboard(MASK, false)]);
+            self.mask_win |= modifiers.iter().any(|k| matches!(*k, LEFT_WIN | RIGHT_WIN));
+        }
+        send(&modifiers.iter().map(|&k| keyboard(k, false)).collect::<Vec<_>>());
+        if !modifiers.is_empty() {
+            settle();
         }
         let layout = foreground_layout();
         let units: Vec<u16> = text.encode_utf16().collect();
@@ -671,6 +702,14 @@ impl crate::media::InputSink for Injector {
                 }
             }
             i += 1;
+        }
+        send(&modifiers.iter().map(|&k| keyboard(k, true)).collect::<Vec<_>>());
+        if menu_modifier {
+            // Restored Alt/Win must not look like a standalone press when later released.
+            send(&[keyboard(MASK, true), keyboard(MASK, false)]);
+        }
+        if !modifiers.is_empty() {
+            settle();
         }
         true
     }

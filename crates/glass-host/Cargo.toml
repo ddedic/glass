@@ -133,3 +133,6 @@ vaapi = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 # Windows: the version resource (name, version) on glass.exe and glassw.exe, which code
 # signing checks.
 winresource = { version = "0.1.34", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.54.0", features = ["test-util"] }

@@ -673,6 +673,15 @@ test.describe('audio', () => {
 });
 
 test.describe('resilience', () => {
+  /** What the browser says about the page (Chrome on Windows says hidden when it's covered). */
+  const report = (p, state) => p.evaluate((state) => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, state);
+  const IPAD_UA = 'Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
+  const paused = (host) => host.clientLog('video paused (tab hidden)').length;
+  const resumed = (host) => host.clientLog('input while reported hidden: video resumed').length;
+
   it('recovers from lost frames with a keyframe', async ({ page, host }) => {
     await open(page, host);
     await host.post('/test/drop?frames=3');
@@ -705,25 +714,107 @@ test.describe('resilience', () => {
   });
 
   it('keeps streaming while a desktop tab is briefly hidden; an iPad pauses at once', async ({ page, browser, host }) => {
-    const hide = (p) => p.evaluate(() => {
-      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
-      document.dispatchEvent(new Event('visibilitychange'));
-    });
     // Covered by another window, as on every Alt+Tab on Windows: switching back must not
     // wait for a keyframe and a new decoder.
     await open(page, host);
-    await hide(page);
+    await report(page, 'hidden');
     await expect.poll(() => host.clientLog('visibility: hidden').length).toBe(1);
     await page.waitForTimeout(1500);
     expect(host.clientLog('video paused (tab hidden)')).toHaveLength(0);
     expect((await stats(page)).fps).toBeGreaterThan(10);
 
-    const ipad = await browser.newPage({
-      userAgent: 'Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
-    });
+    const ipad = await browser.newPage({ userAgent: IPAD_UA });
     await open(ipad, host);
-    await hide(ipad);
-    await expect.poll(() => host.clientLog('video paused (tab hidden)').length).toBe(1);
+    await report(ipad, 'hidden');
+    await expect.poll(() => paused(host)).toBe(1);
+  });
+
+  it('input resumes video that a hidden report paused', async ({ browser, host }) => {
+    // An iPad pauses at once on hidden, so this needs no wait.
+    const ipad = await browser.newPage({ userAgent: IPAD_UA });
+    await open(ipad, host);
+    await report(ipad, 'hidden');
+    await expect.poll(() => paused(host)).toBe(1);
+    // Input only reaches a page that's on screen, whatever the browser says.
+    const box = await ipad.locator('#screens canvas:not(.hidden)').first().boundingBox();
+    await ipad.mouse.move(box.x + 50, box.y + 50);
+    await expect.poll(() => resumed(host)).toBe(1);
+    await expect.poll(() => host.clientLog('video resumed (tab visible)').length).toBe(1);
+    await expect.poll(async () => (await stats(ipad)).fps).toBeGreaterThan(10);
+  });
+
+  it('input resumes a page that loaded reported hidden', async ({ browser, host }) => {
+    // Reloading to fix a frozen picture while the browser still says hidden.
+    const ipad = await browser.newPage({ userAgent: IPAD_UA });
+    await ipad.addInitScript(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    });
+    await ipad.goto(host.url());
+    const canvas = ipad.locator('#screens canvas:not(.hidden)').first();
+    await expect(canvas).toBeVisible();
+    const box = await canvas.boundingBox();
+    await ipad.mouse.move(box.x + 50, box.y + 50);
+    await expect.poll(() => resumed(host)).toBe(1);
+    await expect.poll(async () => (await stats(ipad)).fps).toBeGreaterThan(10);
+  });
+
+  it('a desktop page stuck "hidden" keeps streaming while used, and pauses once left alone', async ({ page, host }) => {
+    // Edge on Windows reported a page hidden for minutes while it was on screen and in use.
+    await page.clock.install();
+    await open(page, host);
+    const box = await page.locator('#screens canvas:not(.hidden)').first().boundingBox();
+    await report(page, 'hidden');
+    for (let i = 0; i < 3; i++) {
+      await page.mouse.move(box.x + 50 + i, box.y + 50);
+      await page.clock.runFor(50_000);
+    }
+    await page.waitForTimeout(1500); // client logs reach the host asynchronously
+    expect(paused(host)).toBe(0);
+    // Nobody using it any more: paused 60 s after the last input.
+    await page.clock.runFor(11_000);
+    await expect.poll(() => paused(host)).toBe(1);
+  });
+
+  it('coming back from away on a page stuck "hidden" does not pause it', async ({ page, host }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem('glass.pauseAway', '1');
+      navigator.permissions.query = async () => ({ state: 'granted' });
+      window.IdleDetector = class extends EventTarget {
+        static requestPermission = async () => 'granted';
+        userState = 'active';
+        screenState = 'unlocked';
+        async start() {
+          window.idle = (userState) => {
+            this.userState = userState;
+            this.dispatchEvent(new Event('change'));
+          };
+        }
+      };
+    });
+    const resumedVideo = () => host.clientLog('video resumed (tab visible)').length;
+    await open(page, host);
+    await page.waitForFunction(() => window.idle);
+    const box = await page.locator('#screens canvas:not(.hidden)').first().boundingBox();
+    await report(page, 'hidden');
+    await page.evaluate(() => window.idle('idle'));
+    await expect.poll(() => paused(host)).toBe(1);
+    // Input while still away doesn't override it, but counts once they're back.
+    await page.mouse.move(box.x + 50, box.y + 50);
+    await page.waitForTimeout(1500); // client logs reach the host asynchronously
+    expect(resumedVideo()).toBe(0);
+    await page.evaluate(() => window.idle('active'));
+    await expect.poll(resumedVideo).toBe(1);
+    await page.waitForTimeout(1500);
+    expect(paused(host)).toBe(1);
+    expect((await stats(page)).fps).toBeGreaterThan(10);
+    // Away also holds when the page turns visible, until they're back.
+    await page.evaluate(() => window.idle('idle'));
+    await expect.poll(() => paused(host)).toBe(2);
+    await report(page, 'visible');
+    await page.waitForTimeout(1500);
+    expect(resumedVideo()).toBe(1);
+    await page.evaluate(() => window.idle('active'));
+    await expect.poll(resumedVideo).toBe(2);
   });
 
   it('reconnects after the host restarts', async ({ page, host }) => {

@@ -54,6 +54,7 @@ pub fn install(start_at_login: bool) -> Result<()> {
          PartOf=graphical-session.target\n\
          \n\
          [Service]\n\
+         Environment=GLASS_SUPERVISED=1\n\
          ExecStart={exe}\n\
          Restart=on-failure\n\
          RestartSec=2\n\

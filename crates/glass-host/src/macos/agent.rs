@@ -44,6 +44,7 @@ pub fn install(start_at_login: bool) -> Result<()> {
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
   <key>EnvironmentVariables</key><dict>
+    <key>GLASS_SUPERVISED</key><string>1</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>StandardOutPath</key><string>{out}</string>

@@ -4,6 +4,10 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 
 ## Unreleased
 
+- If Glass starts before Tailscale, as it can at boot, it no longer stays on plain HTTP and out of reach of the tailnet until someone restarts it. For five minutes it watches for Tailscale, then restarts itself with its HTTPS certificate as soon as nobody is connected. On Windows this covers the background app and the sign-in screen; on macOS and Linux, the background service once `glass setup` has run again. `glass` run in a terminal stays as it is.
+- On Windows, the Glass firewall rule follows `glass config bind`. `tailscale` allows only 100.64.0.0/10 and fd7a:115c:a1e0::/48. A loopback-only bind removes the rule. The default listen address is unchanged: private networks, any remote address. `glass setup` and `glass service install` apply it. An elevated `glass config bind` applies it; otherwise Glass says to run `glass setup`. A silent install or upgrade restores the saved scope; with none saved it restores the older private-network rule, and a firewall failure does not stop the install. One existing Glass rule is updated in place; several rules with that name are replaced by one. A failed update of a single rule leaves it as it was. The any-address fallback is not stored, so a later `glass service install` with no scope leaves that copy's rule alone. A saved loopback scope adds no rule and says so. `glass uninstall --everything` clears the saved scope only when Glass is not installed for everyone; a full MSI uninstall clears it.
+- The picture no longer freezes while you're using a page the browser wrongly reports as hidden (Edge on Windows did this under an always-on-top overlay, for minutes at a time). Input now counts as the page being on screen: video keeps going, and resumes if it had paused. A tab that's really in the background still pauses as before.
+
 ## 0.14.0
 
 November 4, 2026

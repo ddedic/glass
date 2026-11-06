@@ -9,13 +9,24 @@ pub fn restart_glass() -> Result<()> {
         return Ok(());
     }
     tracing::info!("restarting Glass (asked by a viewer)");
+    exit_to_restart();
+    Ok(())
+}
+
+/// The certificate arrived after startup (`tailscale::wait_for_cert`). The listeners, the
+/// viewer's address and WebTransport are all chosen once at startup, so start again.
+pub fn restart_for_certificate() {
+    tracing::info!("restarting Glass (Tailscale is up: serving HTTPS)");
+    exit_to_restart();
+}
+
+fn exit_to_restart() {
     crate::viewers::disconnect_all();
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_millis(300));
         // A non-zero exit: the login item / systemd unit starts it again.
         std::process::exit(75);
     });
-    Ok(())
 }
 
 pub fn restart_computer() -> Result<()> {

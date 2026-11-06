@@ -141,6 +141,31 @@ it('keyboard and mouse mode pauses and hides the picture, and the whole screen i
   await expect(page.locator('#tp-cursor')).toBeVisible(); // trackpad mode was on (a phone), and still is
 });
 
+it('input in keyboard and mouse mode keeps the video paused, even on a page reported hidden', async ({ browser, host }) => {
+  // A phone's user agent: hidden pauses at once there, so input has something to resume.
+  const userAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
+  const page = await (await browser.newContext({ ...phone, userAgent })).newPage();
+  await page.goto(host.url());
+  await expectVideo(page);
+  await toolbarClick(page, 'btn-more');
+  await page.getByRole('menuitemradio', { name: /Keyboard and mouse mode/ }).click();
+  await expect.poll(() => host.clientLog(/^video paused/).length).toBeGreaterThan(0);
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+
+  await host.clearInput();
+  await fingers(page, [{ type: 'pointerdown', x: 20, y: 20 }, { type: 'pointermove', x: 30, y: 20 }, { type: 'pointermove', x: 60, y: 20 }, { type: 'pointerup', x: 60, y: 20 }]);
+  await expect.poll(async () => (await host.input('move')).events.length).toBeGreaterThan(0);
+  await page.waitForTimeout(1500); // client logs reach the host asynchronously
+  expect(host.clientLog(/^video resumed/)).toHaveLength(0);
+
+  // Tapping to leave is input too, so the picture comes back though it's still reported hidden.
+  await page.locator('#pad-exit').click();
+  await expect.poll(() => host.clientLog(/^video resumed/).length).toBeGreaterThan(0);
+});
+
 it('hiding the toolbar keeps the keyboard up, and the zoom pill clears the toolbar', async ({ browser, host }) => {
   const page = await (await browser.newContext(phone)).newPage();
   await page.goto(host.url());

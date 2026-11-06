@@ -13,6 +13,10 @@ pub fn set_setting(key: &str, value: &str) -> Result<String> {
     let mut s = settings::load();
     s.set(key, value)?;
     settings::save(&s)?;
+    #[cfg(windows)]
+    if key == "bind" {
+        return Ok(crate::platform::firewall::bind_change_note().unwrap_or_default());
+    }
     Ok(String::new())
 }
 

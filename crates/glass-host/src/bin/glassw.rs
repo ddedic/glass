@@ -65,6 +65,7 @@ mod agent {
         let _ = std::fs::create_dir_all(log_dir());
         let out = std::fs::OpenOptions::new().create(true).append(true).open(log_dir().join("agent.log"))?;
         Command::new(host)
+            .env("GLASS_SUPERVISED", "1")
             .stdin(Stdio::null())
             .stdout(out.try_clone()?)
             .stderr(out)

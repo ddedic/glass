@@ -26,6 +26,7 @@ mod keys;
 mod ldap;
 mod lid;
 mod listen;
+mod firewall_bind;
 mod lossless;
 #[cfg(not(target_os = "macos"))]
 mod mailbox;
@@ -378,6 +379,12 @@ enum Command {
     Service {
         #[arg(value_parser = ["install", "uninstall", "status"], default_value = "status")]
         action: String,
+        /// MSI full uninstall only: also remove the installed program's firewall rule.
+        #[arg(long, hide = true)]
+        remove_host_rule: bool,
+        /// Classified before elevation. The elevated install does not read settings.
+        #[arg(long, hide = true, value_parser = ["tailscale", "loopback", "any"])]
+        firewall_scope: Option<String>,
     },
     /// Wake a machine with Wake-on-LAN, by a MAC address or a tailnet name seen before.
     Wake { target: String },
@@ -584,6 +591,12 @@ fn config_cli(key: Option<&str>, value: Option<&str>) -> Result<()> {
             s.set(k, v)?;
             settings::save(&s)?;
             println!("{k} = {}", s.get(k)?);
+            #[cfg(windows)]
+            if k == "bind"
+                && let Some(note) = platform::firewall::bind_change_note()
+            {
+                println!("{note}");
+            }
             // A generated token is shown once, to paste into the identity provider.
             if k == "scim-token" && v == "new"
                 && let Some(t) = settings::scim_token()
@@ -812,6 +825,7 @@ fn main() -> Result<()> {
         let argv: Vec<String> = std::env::args().collect();
         match argv.get(1).map(String::as_str) {
             Some(platform::service::SERVICE_ARG) => return platform::service::run_service(),
+            Some(platform::firewall::APPLY_ARG) => std::process::exit(if platform::firewall::apply_from_arg(&argv[2..]) { 0 } else { 1 }),
             Some(platform::secure::HELPER_ARG) => return platform::secure::run_helper(),
             Some(platform::micdriver::ARG) => return platform::micdriver::cli(&argv[2..]),
             _ => {}
@@ -1090,7 +1104,9 @@ async fn async_main(args: Args) -> Result<()> {
             Ok(())
         }
         #[cfg(windows)]
-        Some(Command::Service { action }) => platform::service::cli(action),
+        Some(Command::Service { action, remove_host_rule, firewall_scope }) => {
+            platform::service::cli(action, *remove_host_rule, firewall_scope.as_deref())
+        }
         Some(Command::Remote { action }) => remote_cli(action),
         Some(Command::Account { action, json }) => account_cli(action, *json),
         Some(Command::Fleet { action, arg, json }) => fleet_cli(action, arg.as_deref(), *json),
@@ -1278,6 +1294,17 @@ async fn run_host(args: Args) -> Result<()> {
             .await
             .map(|(cert, key)| server::TlsFiles { cert, key }),
     };
+    // Started before Tailscale (at boot, say): pick up HTTPS once it's there, when nobody is
+    // connected. Only under something that starts Glass again, or it would just quit.
+    let restarted = signin::active() || std::env::var_os("GLASS_SUPERVISED").is_some();
+    if tls.is_none() && restarted && !args.test && !support::is_host() {
+        tokio::spawn(async {
+            if tailscale::wait_for_cert(&config_dir().join("certs")).await {
+                viewers::until_none().await;
+                power::restart_for_certificate();
+            }
+        });
+    }
     let host = tls
         .as_ref()
         .and_then(|t| t.cert.file_stem())

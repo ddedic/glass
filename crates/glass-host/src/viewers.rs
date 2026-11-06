@@ -79,6 +79,11 @@ pub fn subscribe() -> watch::Receiver<Vec<Viewer>> {
     channel().subscribe()
 }
 
+/// Returns once nobody is connected.
+pub async fn until_none() {
+    let _ = subscribe().wait_for(|viewers| viewers.is_empty()).await;
+}
+
 /// Records a signed-in viewer until the returned guard drops (the session ends).
 pub fn joined(viewer: Viewer, conn: wtransport::Connection) -> Leave {
     let id = viewer.id;

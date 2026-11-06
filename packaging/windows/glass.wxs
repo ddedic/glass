@@ -5,14 +5,17 @@
   Built by scripts/package.ps1 with WiX Toolset 5 (wix build -arch x64|arm64 -d Version=…
   -d Stage=… -d Icon=…). Installs to Program Files\Glass with the zip's layout, starts glassw
   for each user who signs in (the HKLM Run key), adds the Start menu shortcut, puts glass on
-  the PATH and lets Glass through Windows Defender Firewall on private networks, as
-  `glass setup` would. The host finds this copy through HKLM\SOFTWARE\Glass InstallDir
+  the PATH. After the files are installed, the package restores Glass's firewall
+  rule from HKLM\SOFTWARE\Glass FirewallScope (tailscale, loopback, or any). When
+  that value is missing, as with an older MSI, it restores the private-network
+  rule that older package added. A firewall failure does not fail the install.
+  `glass setup` narrows the rule to the saved bind and stores the scope.
+  The host finds this copy through HKLM\SOFTWARE\Glass InstallDir
   (src/windows/agent.rs). Settings stay in each user's profile and survive uninstalling.
 
   The UpgradeCode never changes: each new MSI replaces the one before (MajorUpgrade).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package Name="Glass" Manufacturer="Glass" Version="$(var.Version)"
            UpgradeCode="83EBD5C2-954D-4113-A3C1-4797653E5386" Scope="perMachine" Compressed="yes">
@@ -34,10 +37,7 @@
       <Directory Id="INSTALLFOLDER" Name="Glass">
         <Directory Id="BinFolder" Name="bin">
           <Component Id="GlassExe">
-            <File Id="GlassExe" Source="$(var.Stage)\bin\glass.exe" KeyPath="yes">
-              <!-- The rule `glass setup` adds: private networks (home, work, Tailscale) only. -->
-              <fw:FirewallException Id="GlassFirewall" Name="Glass" Profile="private" Scope="any" IgnoreFailure="yes" />
-            </File>
+            <File Id="GlassExe" Source="$(var.Stage)\bin\glass.exe" KeyPath="yes" />
             <Environment Id="GlassPath" Name="PATH" Value="[BinFolder]" Part="last" Action="set" System="yes" />
           </Component>
           <Component Id="GlasswExe">
@@ -78,13 +78,17 @@
     <!-- Installed by hand (with its window): open the app, as the person who ran it, to set
          Glass up. A silent install (/qn) leaves that to sign-in. -->
     <CustomAction Id="OpenGlass" Directory="BinFolder" ExeCommand="&quot;[#GlasswExe]&quot; app" Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
-    <!-- Uninstalled for good (not upgraded): the optional secure-desktop service runs this
-         copy's glass.exe, so it goes too. An upgrade keeps it: the installer closes it with
-         the other copies of glass.exe, and Windows starts it again on the new one. -->
-    <CustomAction Id="RemoveSecureDesktop" FileRef="GlassExe" ExeCommand="service uninstall" Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- Uninstalled for good (not upgraded): removes the secure-desktop service, if it
+         was installed, this program's Glass firewall rule, and FirewallScope. An upgrade
+         keeps all three: the installer closes glass.exe, and Windows starts it again. -->
+    <CustomAction Id="RemoveSecureDesktop" FileRef="GlassExe" ExeCommand="service uninstall --remove-host-rule" Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- After the new files are in place (the old product is already removed): restore
+         the firewall rule from the saved machine scope. Not a full uninstall. -->
+    <CustomAction Id="ApplyFirewallRule" FileRef="GlassExe" ExeCommand="--apply-firewall-rule --from-saved-scope" Execute="deferred" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="OpenGlass" After="InstallFinalize" Condition="UILevel &gt;= 5 AND NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="RemoveSecureDesktop" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="ApplyFirewallRule" After="InstallFiles" Condition="NOT REMOVE~=&quot;ALL&quot;" />
     </InstallExecuteSequence>
   </Package>
 </Wix>

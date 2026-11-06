@@ -4,7 +4,7 @@
 # Zip layout: glass/bin/glass.exe, glass/bin/glassw.exe (the background launcher),
 # glass/share/glass/web/*. The MSI installs the same into Program Files\Glass
 # (packaging/windows/glass.wxs; needs WiX 5: dotnet tool install --global wix --version 5.0.2,
-# then wix extension add -g WixToolset.Firewall.wixext/5.0.2 WixToolset.Util.wixext/5.0.2).
+# then wix extension add -g WixToolset.Util.wixext/5.0.2).
 # With GLASS_PREBUILT set, uses the binaries already built.
 #
 # Signing: with GLASS_SIGN_PFX (a .pfx file) and GLASS_SIGN_PFX_PASSWORD set, the programs
@@ -52,7 +52,7 @@ if ($Step -in 'all', 'bundle') {
     $wixArch = if ($Arch -eq 'arm64') { 'arm64' } else { 'x64' }
     # MSI versions are numbers only.
     $msiVersion = ($version -split '-')[0]
-    wix build packaging/windows/glass.wxs -arch $wixArch -ext WixToolset.Firewall.wixext -ext WixToolset.Util.wixext `
+    wix build packaging/windows/glass.wxs -arch $wixArch -ext WixToolset.Util.wixext `
         -d "Version=$msiVersion" -d "Stage=$((Resolve-Path "$stage/glass").Path)" -d "Icon=$icon" -o "dist/$msi"
     if ($LASTEXITCODE) { throw 'wix build failed' }
     Remove-Item dist/*.wixpdb -ErrorAction SilentlyContinue

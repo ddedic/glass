@@ -32,6 +32,9 @@ jobs:
           shared-key: ci-${{ runner.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --profile ci
+        env:
+          # The Windows job creates a real firewall rule and reads its addresses back.
+          GLASS_FIREWALL_INTEGRATION: ${{ runner.os == 'Windows' && '1' || '0' }}
       - run: cargo build --profile ci -p glass-host
       # The optional VA-API encoder (GLASS_ENCODER=vaapi) builds and its unit tests pass
       # (the GPU test is ignored: runners have no VA device).

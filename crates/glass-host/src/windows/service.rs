@@ -24,11 +24,13 @@ pub const SERVICE_ARG: &str = "--glass-service";
 const SERVICE_NAME: &str = "GlassSecureDesktop";
 const DISPLAY_NAME: &str = "Glass Secure Desktop";
 
-/// `glass service <install|uninstall|status>`.
-pub fn cli(action: &str) -> Result<()> {
+/// `glass service <install|uninstall|status>`. `remove_host_rule` is the MSI's full uninstall.
+/// `firewall_scope` is the word classified before elevation; the elevated process does not
+/// read settings.
+pub fn cli(action: &str, remove_host_rule: bool, firewall_scope: Option<&str>) -> Result<()> {
     match action {
-        "install" => install(),
-        "uninstall" => uninstall(),
+        "install" => install(firewall_scope),
+        "uninstall" => uninstall(remove_host_rule),
         "status" => {
             match status()? {
                 Some(true) => println!("The Glass secure-desktop service is installed and running."),
@@ -79,17 +81,30 @@ unsafe fn close_service_handle(h: *mut core::ffi::c_void) -> bool {
     unsafe { windows::Win32::System::Services::CloseServiceHandle(windows::Win32::System::Services::SC_HANDLE(h)).is_ok() }
 }
 
-fn install() -> Result<()> {
+fn install(firewall_scope: Option<&str>) -> Result<()> {
     if !is_elevated() {
-        // One UAC prompt, like the firewall step (see windows::firewall).
-        return elevate("install");
+        // Classify here, then pass the word. The elevated process must not read settings:
+        // a credential prompt runs as the approving administrator, whose profile is empty.
+        return match super::firewall::saved_remote() {
+            Ok(remote) => elevate(&["install", "--firewall-scope", super::firewall::remote_arg(remote)]),
+            Err(()) => {
+                if super::firewall::scope_for_service(None, super::firewall::machine_scope().as_deref()).is_none() {
+                    println!("Couldn't read the saved listen address, so no firewall rule was added.");
+                }
+                elevate(&["install"])
+            }
+        };
     }
     let exe = protected_copy()?;
     let bin = format!("\"{}\" {SERVICE_ARG}", exe.display());
-    // The sign-in host runs this copy: it needs its own firewall rule (private networks,
-    // like glass setup's), as SYSTEM can't answer Windows' prompt.
-    if super::firewall::inbound(&exe) != Some(super::firewall::Inbound::Allowed) && !super::firewall::add_rule_quietly(&exe) {
-        println!("Couldn't let the sign-in screen's Glass through Windows Firewall; viewers may not reach it.");
+    // The sign-in host runs this copy. The scope is the word we were given, or the one
+    // already stored for the installer. Neither path reads the elevated account's settings.
+    match super::firewall::scope_for_service(firewall_scope, super::firewall::machine_scope().as_deref()) {
+        Some(remote) if !super::firewall::apply_known(&exe, remote) => {
+            println!("Couldn't let the sign-in screen's Glass through Windows Firewall; viewers may not reach it.");
+        }
+        Some(_) => {}
+        None => println!("No firewall scope was given, so the sign-in screen's rule was left unchanged."),
     }
     // The sign-in screen after a restart (signin.rs): this user's token and access rules.
     match copy_signin_settings() {
@@ -256,9 +271,22 @@ unsafe fn restart_on_failure(svc: windows::Win32::System::Services::SC_HANDLE) {
     let _ = unsafe { ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, Some((&raw const config).cast())) };
 }
 
-fn uninstall() -> Result<()> {
+fn uninstall(remove_host_rule: bool) -> Result<()> {
     if !is_elevated() {
-        return elevate("uninstall");
+        return elevate(if remove_host_rule { &["uninstall", "--remove-host-rule"] } else { &["uninstall"] });
+    }
+    // Only a full MSI uninstall asks for this. That action runs this file, so the
+    // program is current_exe, including a custom install directory. A manual
+    // `glass service uninstall` leaves the desktop host's rule alone.
+    if remove_host_rule {
+        if let Ok(exe) = std::env::current_exe()
+            && !super::firewall::remove_rule_quietly(&exe)
+        {
+            println!("Couldn't remove the Glass firewall rule for {}.", exe.display());
+        }
+        if let Err(e) = super::firewall::clear_machine_scope() {
+            println!("{e}");
+        }
     }
     use windows::Win32::System::Services::{
         ControlService, DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS,
@@ -284,7 +312,7 @@ fn uninstall() -> Result<()> {
     }
     let _ = set_sas_policy(false);
     let _ = std::fs::remove_dir_all(signin_dir());
-    // The copy's own rule (an MSI install's rule belongs to the MSI).
+    // The per-user service copy's rule. An MSI install's rule is removed above.
     if super::agent::machine_dir().is_none()
         && let Some(pf) = std::env::var_os("ProgramFiles")
     {
@@ -324,10 +352,11 @@ fn set_sas_policy(on: bool) -> Result<()> {
 }
 
 /// Re-runs `glass service <action>` as administrator (one UAC prompt), like the firewall step.
-fn elevate(action: &str) -> Result<()> {
+fn elevate(extra: &[&str]) -> Result<()> {
     let exe = std::env::current_exe()?;
+    let list = std::iter::once("service").chain(extra.iter().copied()).map(super::ps_string).collect::<Vec<_>>().join(",");
     let script = format!(
-        "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath {} -ArgumentList 'service','{action}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
+        "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath {} -ArgumentList {list} -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
         super::ps_string(&exe.display().to_string())
     );
     let ok = super::powershell(&script).status().is_ok_and(|s| s.success());

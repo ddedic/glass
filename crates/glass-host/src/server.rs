@@ -28,12 +28,12 @@ use crate::clock::now_us;
 use crate::control::{self, ClientMsg, STREAM_CLIPBOARD, STREAM_FILE, STREAM_INPUT, ServerMsg};
 use crate::files;
 use crate::media::EncodedFrame;
-use crate::media::{Clipboard, InputSink, Layout, VideoSource};
+use crate::media::{Clipboard, Layout, VideoSource};
 use crate::tailscale;
 
 pub struct Shared {
     pub frames: broadcast::Sender<Arc<EncodedFrame>>,
-    pub injector: Mutex<Box<dyn InputSink>>,
+    pub injector: crate::input_dispatch::Dispatch,
     pub video: Arc<dyn VideoSource>,
     pub clipboard: Arc<dyn Clipboard>,
     /// Host-wide events fanned out to every authenticated session's control stream.
@@ -612,6 +612,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                 }
                 stream = conn.accept_uni() => {
                     let stream = stream?;
+                    let permit = shared.injector.admit_stream().map_err(anyhow::Error::msg)?;
                     let ctx = SessionCtx {
                         conn: conn.clone(),
                         shared: shared.clone(),
@@ -630,6 +631,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         acking: acking.clone(),
                     };
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = uni_stream(ctx, stream).await {
                             warn!("{peer}: stream failed: {e:#}");
                         }
@@ -646,7 +648,6 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     // Anything still held, when no one else is giving input: another viewer may be holding
     // Shift right now (each input stream lets go of its own keys when it ends).
     if authed.load(Ordering::Relaxed) && INPUT_STREAMS.load(Ordering::Relaxed) == 0 {
-        shared.injector.lock().unwrap().release_all();
         crate::gamepad::release_all();
     }
     info!("client disconnected: {peer}");
@@ -1172,6 +1173,8 @@ async fn control(
         crate::push::activity("Someone joined", &who, &format!("joined-{session_id}"));
     }
     let welcome = ServerMsg::Welcome {
+        // Older viewers ignore this capability; unsupported hosts retain physical input.
+        viewer_typing_v1: cfg!(any(windows, target_os = "macos")),
         displays,
         streams: shared.video.streams(),
         audio: crate::audio::SUPPORTED,
@@ -1295,7 +1298,7 @@ async fn control(
                     None => shared.clipboard.set_text(&text),
                 }
                 if paste && perms.input {
-                    shared.injector.lock().unwrap().paste();
+                    shared.injector.paste();
                 }
             }
             ClientMsg::ClipboardImage => {
@@ -2004,7 +2007,7 @@ fn end_extend(session: u64, shared: Arc<Shared>) {
             let streaming_it = shared.video.streams().iter().any(|d| gone.contains(&d.id));
             if streaming_it && let Ok(streams) = shared.video.set_layout(Layout::Single(None)) {
                 let ids: Vec<u32> = streams.iter().map(|d| d.id).collect();
-                shared.injector.lock().unwrap().set_displays(&ids);
+                shared.injector.set_displays(&ids);
                 let displays = shared.video.displays().ok();
                 let _ = shared.events.send(ServerMsg::Layout { streams, displays });
             }
@@ -2027,7 +2030,7 @@ fn end_fit(session: u64, shared: Arc<Shared>) {
                 drop(old);
                 if let Ok(streams) = shared.video.set_layout(Layout::Single(None)) {
                     let ids: Vec<u32> = streams.iter().map(|d| d.id).collect();
-                    shared.injector.lock().unwrap().set_displays(&ids);
+                    shared.injector.set_displays(&ids);
                     let displays = shared.video.displays().ok();
                     let _ = shared.events.send(ServerMsg::Layout { streams, displays });
                 }
@@ -2063,7 +2066,7 @@ async fn watch_window(shared: Arc<Shared>, id: u32, generation: u64) {
             Some(w) => {
                 let rect = [w.x, w.y, w.points_width, w.points_height];
                 if last.is_some_and(|l| l != rect) {
-                    shared.injector.lock().unwrap().set_window_rect(Some(rect));
+                    shared.injector.set_window_rect(Some(rect));
                 }
                 last = Some(rect);
             }
@@ -2079,9 +2082,8 @@ async fn watch_window(shared: Arc<Shared>, id: u32, generation: u64) {
                 if let Ok(Ok((streams, displays))) = result {
                     let ids: Vec<u32> = streams.iter().map(|d| d.id).collect();
                     {
-                        let mut injector = shared.injector.lock().unwrap();
-                        injector.set_displays(&ids);
-                        injector.set_window_rect(None);
+                        let injector = &shared.injector;
+                        injector.configure(&ids, None);
                     }
                     let _ = shared.events.send(ServerMsg::Layout { streams, displays });
                 }
@@ -2106,14 +2108,13 @@ async fn set_layout(ctx: &SessionCtx, layout: Layout) -> Result<()> {
             let ids: Vec<u32> = streams.iter().map(|d| d.id).collect();
             info!("{peer}: now streaming displays {ids:?}");
             {
-                let mut injector = ctx.shared.injector.lock().unwrap();
-                injector.set_displays(&ids);
+                let injector = &ctx.shared.injector;
                 // A window: absolute coordinates on stream 0 land inside it.
                 let rect = match (layout, streams.first()) {
                     (Layout::Window(_), Some(d)) => Some([d.x, d.y, d.points_width, d.points_height]),
                     _ => None,
                 };
-                injector.set_window_rect(rect);
+                injector.configure(&ids, rect);
             }
             let generation = WINDOW_WATCH.fetch_add(1, Ordering::Relaxed) + 1;
             if let Layout::Window(id) = layout {
@@ -2194,28 +2195,6 @@ fn record_auth_failure(shared: &Shared, peer: std::net::IpAddr) {
 /// left an approved viewer seeing the screen with no mouse or keyboard.
 const AUTH_WAIT: Duration = Duration::from_secs(crate::approval::TIMEOUT.as_secs() + 10);
 
-/// Types text a viewer sent (IME, emoji, accented letters), in order with its keys: the
-/// next event isn't read until it's typed. Hosts without a text path press US keys for
-/// what they can.
-async fn type_viewer_text(ctx: &SessionCtx, text: String) {
-    let shared = ctx.shared.clone();
-    // Typing paces itself (apps drop bursts), so not on the async runtime.
-    let _ = tokio::task::spawn_blocking(move || {
-        let mut injector = shared.injector.lock().unwrap();
-        if injector.type_text(&text) {
-            return;
-        }
-        let (events, missing) = crate::keys::text_key_events(&text);
-        for ev in events {
-            injector.handle(ev);
-        }
-        if missing > 0 {
-            tracing::debug!("input: {missing} characters have no key on this computer; not typed");
-        }
-    })
-    .await;
-}
-
 /// Input streams open right now, across viewers.
 static INPUT_STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -2248,59 +2227,32 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
         STREAM_INPUT => {
             info!("{}: input stream open", ctx.conn.remote_address());
             INPUT_STREAMS.fetch_add(1, Ordering::Relaxed);
+            struct StreamCount;
+            impl Drop for StreamCount { fn drop(&mut self) { INPUT_STREAMS.fetch_sub(1, Ordering::Relaxed); } }
+            let _count = StreamCount;
+            let owner = ctx.shared.injector.open(crate::input_queue::OwnerClass::Viewer).map_err(anyhow::Error::msg)?;
+            let mut wire = crate::input_dispatch::WireInput::new();
             let mut buf = [0u8; INPUT_EVENT_LEN];
             let mut events = 0u64;
-            // What this viewer is holding down, to let go of when it leaves.
-            let mut keys = std::collections::HashSet::new();
-            let mut buttons = std::collections::HashSet::new();
-            // Text from an IME or a phone keyboard, put back together from its chunks.
-            let mut text = glass_proto::TextReader::default();
-            while stream.read_exact(&mut buf).await.is_ok() {
-                // A view-only link's input is read and dropped.
+            loop {
+                tokio::select! {
+                    _ = ctx.conn.closed() => break,
+                    read = stream.read_exact(&mut buf) => if read.is_err() { break; },
+                }
                 if !perms.input {
+                    if !wire.charge(std::time::Instant::now()) { stream.stop(0u32.into()); break; }
                     continue;
                 }
-                match InputEvent::read(&buf) {
-                    Some(ev @ InputEvent::Gamepad { .. }) if !crate::testmode::enabled() => {
-                        crate::gamepad::handle(ev)
-                    }
-                    Some(ev @ InputEvent::Text { .. }) => {
-                        if let Some(text) = text.push(&ev) {
-                            crate::computer::human_input();
-                            type_viewer_text(&ctx, text).await;
-                        }
-                    }
-                    Some(ev) => {
-                        // A person clicking, typing or scrolling: agents wait for them.
-                        if matches!(ev, InputEvent::MouseDown { .. } | InputEvent::KeyDown { .. } | InputEvent::Scroll { .. }) {
-                            crate::computer::human_input();
-                        }
-                        if matches!(ev, InputEvent::MouseMove { .. } | InputEvent::MouseMoveBy { .. }) {
-                            crate::cursor::moved_by(ctx.driver);
-                        }
-                        match ev {
-                            InputEvent::KeyDown { keycode } => _ = keys.insert(keycode),
-                            InputEvent::KeyUp { keycode } => _ = keys.remove(&keycode),
-                            InputEvent::MouseDown { button } => _ = buttons.insert(button),
-                            InputEvent::MouseUp { button } => _ = buttons.remove(&button),
-                            _ => {}
-                        }
-                        ctx.shared.injector.lock().unwrap().handle(ev)
-                    }
-                    None => continue,
+                let Some(ev) = InputEvent::read(&buf) else { break; };
+                if matches!(ev, InputEvent::MouseDown { .. } | InputEvent::KeyDown { .. } | InputEvent::Scroll { .. } | InputEvent::Text { .. }) { crate::computer::human_input(); }
+                if matches!(ev, InputEvent::MouseMove { .. } | InputEvent::MouseMoveBy { .. }) { crate::cursor::moved_by(ctx.driver); }
+                if wire.submit(&owner, ev, std::time::Instant::now()).is_err() {
+                    stream.stop(0u32.into());
+                    break;
                 }
                 events += 1;
             }
-            {
-                let mut injector = ctx.shared.injector.lock().unwrap();
-                for keycode in keys {
-                    injector.handle(InputEvent::KeyUp { keycode });
-                }
-                for button in buttons {
-                    injector.handle(InputEvent::MouseUp { button });
-                }
-            }
-            INPUT_STREAMS.fetch_sub(1, Ordering::Relaxed);
+            drop(owner); // also runs on read failure, connection close and task abortion
             info!(
                 "{}: input stream closed after {events} events",
                 ctx.conn.remote_address()
@@ -2320,7 +2272,7 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
             let clipboard = ctx.shared.clipboard.clone();
             tokio::task::spawn_blocking(move || clipboard.set(&clip)).await?;
             if paste && perms.input {
-                ctx.shared.injector.lock().unwrap().paste();
+                ctx.shared.injector.paste();
             }
         }
         STREAM_FILE if !perms.files => {

@@ -19,7 +19,7 @@ const storageSet = (key, value) => {
 };
 
 
-export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () => {}, onSelectDisplay, onSharp, onListWindows, onSelectWindow, onShortcut, shortcuts, swapCmdOption, onSwapCmdOption, ctrlAsCmd, onCtrlAsCmd, pcKeyboard, onPcKeyboard, onKeyboard, onUploadFiles, onRequestFiles, onAudio, onMic, onFullscreen, onToggleStats, onPrivacy, onRestart, onSas, onToken, onTerminal = () => {}, onOpenDevice = () => {}, onTrackpad = () => {}, onPad = () => {}, onExtend = () => {}, resolution = 'auto', onResolution, fitSizes = () => [], deviceName = () => 'device' }) {
+export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () => {}, onSelectDisplay, onSharp, onListWindows, onSelectWindow, onShortcut, shortcuts, swapCmdOption, onSwapCmdOption, ctrlAsCmd, onCtrlAsCmd, pcKeyboard, onPcKeyboard, onPhysicalKeyboard, onOptionAsAlt, onKeyboard, onUploadFiles, onRequestFiles, onAudio, onMic, onFullscreen, onToggleStats, onPrivacy, onRestart, onSas, onToken, onTerminal = () => {}, onOpenDevice = () => {}, onTrackpad = () => {}, onPad = () => {}, onExtend = () => {}, resolution = 'auto', onResolution, fitSizes = () => [], deviceName = () => 'device' }) {
   const toolbar = $('toolbar');
   // Each toolbar menu: its button and panel.
   const menus = {
@@ -493,6 +493,9 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
   let privacyOn = false;
   let hostOs;
   let canInput = true;
+  let viewerTyping = false;
+  let physicalKeyboard = false;
+  let optionAsAlt = false;
   function renderMore() {
     const items = [
       menuItem('Stats', 'Ctrl+Shift+H', {
@@ -500,6 +503,26 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
         onSelect: () => { setMenuOpen('more', false); onToggleStats?.(); },
       }),
     ];
+    if (canInput && viewerTyping && hostOs !== 'linux') {
+      items.push(menuItem('Physical keyboard', 'Use host layout (games)', {
+        checked: physicalKeyboard,
+        onSelect: () => {
+          physicalKeyboard = !physicalKeyboard;
+          onPhysicalKeyboard?.(physicalKeyboard);
+          renderMore();
+        },
+      }));
+    }
+    if (canInput && viewerTyping && hostOs === 'windows' && /Mac|iPhone|iPad/.test(navigator.platform)) {
+      items.push(menuItem('Option as Alt', 'Use Option for Windows shortcuts', {
+        checked: optionAsAlt,
+        onSelect: () => {
+          optionAsAlt = !optionAsAlt;
+          onOptionAsAlt?.(optionAsAlt);
+          renderMore();
+        },
+      }));
+    }
     // Ctrl+Alt+Del: any input-capable viewer of a Windows host (needs the secure-desktop service).
     if (hostOs === 'windows' && canInput) {
       items.push(menuItem('Send Ctrl+Alt+Del', 'secure attention', {
@@ -721,11 +744,18 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
       renderBar();
       renderMore();
     },
+    setViewerTyping(on) {
+      viewerTyping = on === true;
+      renderMore();
+    },
     /** Shows this machine's keyboard remaps in the menu. */
-    setKeyboardProfile({ pc, ctrlAsCmd, swap }) {
+    setKeyboardProfile({ pc, ctrlAsCmd, swap, physical = false, optionAsAlt: alt = false }) {
       pcItem.set(pc);
       ctrlItem.set(ctrlAsCmd);
       swapItem.set(swap);
+      physicalKeyboard = physical;
+      optionAsAlt = alt;
+      renderMore();
     },
     /** Ports the host forwards (owner, tailnet): each opens in a new tab at `urlFor(port)`. */
     setPorts(ports, urlFor) {

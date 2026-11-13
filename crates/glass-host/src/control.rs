@@ -183,6 +183,8 @@ pub enum ServerMsg {
         streams: Vec<DisplayInfo>,
         audio: bool,
         host_os: &'static str,
+        /// Viewer character typing with physical Space is enabled only after native validation.
+        viewer_typing_v1: bool,
         guest: bool,
         /// This session's id (chat and drawings from it carry it as `sender`).
         session: u64,

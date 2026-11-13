@@ -198,7 +198,7 @@ const control = (msg) => worker.postMessage({ type: 'control', msg });
 // A view-only link sends no input (the host would drop it anyway).
 let inputAllowed = true;
 // Text events come ready made (textEvents); the rest from their fields.
-const send = (kind, fields) => inputAllowed && worker.postMessage({ type: 'input', bytes: kind === Input.TEXT ? fields.bytes : inputEvent(kind, fields) });
+const send = (kind, fields) => inputAllowed && worker.postMessage({ type: 'input', bytes: fields?.bytes ?? inputEvent(kind, fields) });
 let session = 0; // this session's id, from welcome (chat from it is our own)
 let perms = { input: true, clipboard: true, files: true, owner: true };
 let features = {};
@@ -384,6 +384,16 @@ const ui = createUI({
     input.setPcKeyboard(on);
     log('info', `pc keyboard ${on ? 'on' : 'off'}`);
   },
+  onOptionAsAlt: (on) => {
+    keyboard.optionAsAlt = on;
+    saveKeyboard();
+    input.setOptionAsAlt(on);
+  },
+  onPhysicalKeyboard: (on) => {
+    keyboard.physical = on;
+    saveKeyboard();
+    input.setPhysicalKeyboard(on);
+  },
   onCtrlAsCmd: (on) => {
     storage((s) => s.setItem(CTRL_AS_CMD_KEY, on ? '1' : '0'));
     keyboard.ctrlAsCmd = on;
@@ -478,7 +488,7 @@ function portUrl(port) {
 }
 
 // This machine's keyboard remaps (each machine keeps its own).
-let keyboard = { pc: pcKeyboard, ctrlAsCmd, swap: storage((s) => s.getItem(SWAP_KEY)) === '1' };
+let keyboard = { pc: pcKeyboard, ctrlAsCmd, swap: storage((s) => s.getItem(SWAP_KEY)) === '1', physical: false, optionAsAlt: false };
 // Keyed by host and port, so two Glass hosts on one name (tests, or several on a box) differ.
 const profileId = () => (currentHost.includes(':') ? currentHost : `${currentHost}:${config.wtPort}`);
 function saveKeyboard() {
@@ -486,10 +496,12 @@ function saveKeyboard() {
 }
 function applyKeyboard(hostOs) {
   const p = storage((s) => loadProfile((k) => s.getItem(k), profileId(), { fallback: keyboard, hostOs, isPC })) ?? keyboard;
-  keyboard = { pc: p.pc, ctrlAsCmd: p.ctrlAsCmd, swap: p.swap };
+  keyboard = { pc: p.pc, ctrlAsCmd: p.ctrlAsCmd, swap: p.swap, physical: p.physical, optionAsAlt: p.optionAsAlt };
   input.setPcKeyboard(keyboard.pc);
   input.setCtrlAsCmd(keyboard.ctrlAsCmd);
   input.setSwapCmdOption(keyboard.swap);
+  input.setPhysicalKeyboard(keyboard.physical);
+  input.setOptionAsAlt(keyboard.optionAsAlt);
   ui.setKeyboardProfile(keyboard);
 }
 
@@ -867,7 +879,9 @@ function onControl(msg) {
       if (!msg.streams.length && displays.length) control({ t: 'selectDisplay', id: displays[0].id });
       ui.setAudioAvailable(msg.audio);
       input.setHostOs(msg.host_os ?? 'macos');
+      input.setViewerTyping(msg.viewer_typing_v1 === true);
       ui.setHostOs(msg.host_os ?? 'macos');
+      ui.setViewerTyping(msg.viewer_typing_v1 === true);
       applyKeyboard(msg.host_os ?? 'macos');
       files.setHostOs(msg.host_os ?? 'macos');
       if (remoteKey) rememberRemote(msg.computer);
@@ -1116,6 +1130,8 @@ function onConnectionStatus(text) {
     return;
   }
   if (text !== 'connected') {
+    input.setViewerTyping(false);
+    ui.setViewerTyping(false);
     cancelStart();
     thumbs.setConnected(false);
     device.setConnected(false);
@@ -1177,6 +1193,8 @@ async function loadMachines() {
 }
 
 function switchMachine(host, name = host) {
+  input.setViewerTyping(false);
+  ui.setViewerTyping(false);
   currentHost = host;
   machineFailures = 0;
   storage((s) => (host === homeHost ? s.removeItem(MACHINE_KEY) : s.setItem(MACHINE_KEY, host)));

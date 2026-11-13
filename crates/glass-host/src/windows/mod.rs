@@ -95,11 +95,6 @@ pub fn keep_awake() -> Option<std::process::Child> {
     None
 }
 
-/// A tiny pointer nudge counts as input and turns displays back on.
-pub fn wake_displays() {
-    input::nudge();
-}
-
 pub fn has_command(name: &str) -> bool {
     Command::new("where")
         .arg(name)

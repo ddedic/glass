@@ -144,7 +144,36 @@ pub trait VideoSource: Send + Sync {
 
 /// Where client input goes (the platform injector, or a recorder in tests).
 pub trait InputSink: Send {
+    /// Bounded native executor API. Only input_dispatch's worker may call this API.
+    /// Legacy backend helpers must never be used by producers.
+    /// Unsupported guarantees no attempt; all other failures prohibit fallback/replay.
+    /// Completed means native submission, not delivery to an application. Controls that
+    /// reset routes/holds are coordinated by the worker before execution.
+    /// The worker must invalidate a route on Unknown (and any unsuccessful native Up).
+    fn execute_step(&mut self, operation: &crate::input_queue::Operation) -> crate::text_input::Completion {
+        if matches!(operation, crate::input_queue::Operation::Ownership) {
+            crate::text_input::Completion::Completed
+        } else {
+            crate::text_input::Completion::Unsupported
+        }
+    }
+
+    /// One release-only recovery on the executor that attempted this step. Never reroute
+    /// or replay an uncertain Down on a replacement executor.
+    fn recover_step(&mut self, operation: &crate::input_queue::Operation) {
+        if let crate::input_queue::Operation::Down(physical) = operation {
+            let _ = self.execute_step(&crate::input_queue::Operation::Up(*physical));
+        }
+        self.release_all();
+    }
+    fn reset_state(&mut self) -> crate::text_input::Completion {
+        self.release_all();
+        crate::text_input::Completion::Completed
+    }
     fn handle(&mut self, ev: glass_proto::InputEvent);
+    /// Legacy compatibility only; producers submit through input_dispatch.
+    fn handle_from(&mut self, _owner: u64, ev: glass_proto::InputEvent) { self.handle(ev); }
+    fn release_owner(&mut self, _owner: u64) {}
     /// Pastes the host clipboard (the platform's paste shortcut).
     fn paste(&mut self);
     /// Releases anything still held, e.g. when a client disconnects mid-drag.

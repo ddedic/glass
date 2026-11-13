@@ -330,7 +330,7 @@ pub(crate) fn announce(kind: &str, detail: String, at: Option<(u32, f32, f32)>) 
 /// Where the pointer was last put (global points), for checking what a click there reaches.
 static POINTER: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
-fn inject(events: impl IntoIterator<Item = InputEvent>) -> Result<(), Refused> {
+async fn inject(events: impl IntoIterator<Item = InputEvent>) -> Result<(), Refused> {
     use crate::grants::{Target, check_input};
     let events: Vec<InputEvent> = events.into_iter().collect();
     if events.iter().any(|e| matches!(e, InputEvent::KeyDown { .. })) {
@@ -345,20 +345,18 @@ fn inject(events: impl IntoIterator<Item = InputEvent>) -> Result<(), Refused> {
         crate::cursor::moved_by(crate::cursor::AGENT);
     }
     let shared = shared()?;
-    let mut sink = shared.injector.lock().unwrap();
-    for ev in events {
-        sink.handle(ev);
-    }
-    Ok(())
+    let target = if events.iter().any(|e| matches!(e, InputEvent::KeyDown { .. })) { Some(Target::Keys) }
+        else { POINTER.lock().unwrap().map(|(x,y)| Target::Point(x,y)) };
+    shared.injector.local().map_err(Refused)?.events_checked(events, target).map_err(Refused)?.wait().await.map_err(|e| Refused(e.to_string()))
 }
 
-fn move_to(d: &DisplayInfo, x: f32, y: f32) -> Result<(), Refused> {
+async fn move_to(d: &DisplayInfo, x: f32, y: f32) -> Result<(), Refused> {
     let at = (d.x + x as f64 * d.points_width, d.y + y as f64 * d.points_height);
     crate::grants::check_input(crate::grants::Target::Point(at.0, at.1)).map_err(Refused)?;
     *POINTER.lock().unwrap() = Some(at);
     crate::cursor::moved_by(crate::cursor::AGENT);
-    shared()?.injector.lock().unwrap().move_on_display(d.id, x, y);
-    Ok(())
+    shared()?.injector.local().map_err(Refused)?.controls(vec![crate::input_queue::Control::Move { display: d.id, x, y }], Some(crate::grants::Target::Point(at.0, at.1)))
+        .map_err(Refused)?.wait().await.map_err(|e| Refused(e.to_string()))
 }
 
 /// An agent under a grant doesn't see protected apps (passwords, keychains…), or apps
@@ -436,9 +434,9 @@ pub async fn click(id: Option<u32>, x: f64, y: f64, button: Option<&str>, count:
     let d = display(id).await?;
     let b = button_code(button)?;
     let (nx, ny) = normalize(&d, x, y);
-    move_to(&d, nx, ny)?;
+    move_to(&d, nx, ny).await?;
     for _ in 0..count.clamp(1, 3) {
-        inject([InputEvent::MouseDown { button: b }, InputEvent::MouseUp { button: b }])?;
+        inject([InputEvent::MouseDown { button: b }, InputEvent::MouseUp { button: b }]).await?;
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
     let what = match (count, button.unwrap_or("left")) {
@@ -455,7 +453,7 @@ pub async fn pointer(id: Option<u32>, x: f64, y: f64) -> Result<Value, Refused> 
     may_act(false).await?;
     let d = display(id).await?;
     let (nx, ny) = normalize(&d, x, y);
-    move_to(&d, nx, ny)?;
+    move_to(&d, nx, ny).await?;
     announce("move", format!("to {x:.0}, {y:.0}"), Some((d.id, nx, ny)));
     Ok(json!({ "ok": true }))
 }
@@ -465,16 +463,16 @@ pub async fn drag(id: Option<u32>, from: [f64; 2], to: [f64; 2]) -> Result<Value
     let d = display(id).await?;
     let (fx, fy) = normalize(&d, from[0], from[1]);
     let (tx, ty) = normalize(&d, to[0], to[1]);
-    move_to(&d, fx, fy)?;
-    inject([InputEvent::MouseDown { button: 0 }])?;
+    move_to(&d, fx, fy).await?;
+    inject([InputEvent::MouseDown { button: 0 }]).await?;
     // In steps, so apps see a drag rather than a jump.
     const STEPS: u32 = 12;
     for i in 1..=STEPS {
         let t = i as f32 / STEPS as f32;
         tokio::time::sleep(Duration::from_millis(16)).await;
-        move_to(&d, fx + (tx - fx) * t, fy + (ty - fy) * t)?;
+        move_to(&d, fx + (tx - fx) * t, fy + (ty - fy) * t).await?;
     }
-    inject([InputEvent::MouseUp { button: 0 }])?;
+    inject([InputEvent::MouseUp { button: 0 }]).await?;
     announce("drag", format!("from {:.0}, {:.0} to {:.0}, {:.0}", from[0], from[1], to[0], to[1]), Some((d.id, tx, ty)));
     Ok(json!({ "ok": true }))
 }
@@ -483,8 +481,8 @@ pub async fn scroll(id: Option<u32>, x: f64, y: f64, dx: f64, dy: f64) -> Result
     may_act(false).await?;
     let d = display(id).await?;
     let (nx, ny) = normalize(&d, x, y);
-    move_to(&d, nx, ny)?;
-    inject([InputEvent::Scroll { dx: dx as f32, dy: dy as f32 }])?;
+    move_to(&d, nx, ny).await?;
+    inject([InputEvent::Scroll { dx: dx as f32, dy: dy as f32 }]).await?;
     announce("scroll", format!("by {dx:.0}, {dy:.0}"), Some((d.id, nx, ny)));
     Ok(json!({ "ok": true }))
 }
@@ -495,18 +493,8 @@ pub async fn type_text(text: &str) -> Result<Value, Refused> {
         return Err(Refused("too much text at once (10,000 characters at most)".into()));
     }
     crate::grants::check_input(crate::grants::Target::Keys).map_err(Refused)?;
-    let typed = shared()?.injector.lock().unwrap().type_text(text);
-    if !typed {
-        // Key by key on a US layout.
-        let mut events = Vec::new();
-        for c in text.chars() {
-            events.extend(
-                crate::keys::char_events(c)
-                    .ok_or_else(|| Refused(format!("can't type {c:?} on this computer; try pasting it")))?,
-            );
-        }
-        inject(events)?;
-    }
+    shared()?.injector.local().map_err(Refused)?.text(text.into()).map_err(Refused)?
+        .wait().await.map_err(|e| Refused(e.to_string()))?;
     // An agent's typing isn't shown to viewers or logged, nor anyone's into a password
     // field: it may be a secret.
     let shown = if matches!(crate::grants::current(), crate::grants::Actor::Agent(_)) || crate::grants::secure_input() {
@@ -526,7 +514,7 @@ pub async fn key(keys: &str) -> Result<Value, Refused> {
     let codes = crate::keys::combo(keys).map_err(Refused)?;
     let mut events: Vec<InputEvent> = codes.iter().map(|&keycode| InputEvent::KeyDown { keycode }).collect();
     events.extend(codes.iter().rev().map(|&keycode| InputEvent::KeyUp { keycode }));
-    inject(events)?;
+    inject(events).await?;
     announce("key", shown_keys(keys), None);
     Ok(json!({ "ok": true }))
 }

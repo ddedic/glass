@@ -24,7 +24,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-    GetKeyboardLayout, HKL, MAPVK_VK_TO_VSC, MOUSEINPUT, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VkKeyScanExW,
+    MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, PEN_FLAG_NONE, PEN_MASK_PRESSURE, PEN_MASK_ROTATION, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN,
@@ -70,6 +70,12 @@ pub struct Injector {
     /// Input is going through the SYSTEM secure-desktop helper (the lock screen is up or an
     /// elevated window has focus), not this process's own SendInput. See `windows::secure`.
     routing: bool,
+    native_executor: bool,
+    attempted_local: bool,
+    desktop: Option<Vec<u16>>,
+    route_initialized: bool,
+    route_epoch: u64,
+    step_client: Option<super::secure::StepClient>,
     /// A paste lifted and restored the Windows key (⌘ from a Mac viewer): letting it go now,
     /// with nothing pressed in between, would open Start.
     mask_win: bool,
@@ -85,63 +91,6 @@ const MASK: Key = Key::Vk(0xE8);
 
 /// The shortest a key is held down for.
 const MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(8);
-
-/// After each character typed as a Unicode key event, for the app to read it.
-const UNICODE_GAP: std::time::Duration = std::time::Duration::from_millis(40);
-
-/// The keyboard layout of the app in front (what its keys type).
-fn foreground_layout() -> HKL {
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
-    // SAFETY: plain queries.
-    unsafe { GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), None)) }
-}
-
-/// The key that types `unit` on `layout`, and whether it needs Shift. Characters that need
-/// Ctrl or AltGr, or aren't on the layout, have none.
-fn layout_key(unit: u16, layout: HKL) -> Option<(u16, bool)> {
-    // SAFETY: a plain lookup.
-    let scan = unsafe { VkKeyScanExW(unit, layout) };
-    if scan == -1 {
-        return None;
-    }
-    let (vk, mods) = ((scan & 0xFF) as u16, (scan >> 8) & 0xFF);
-    if mods & !1 != 0 {
-        return None;
-    }
-    let shift = mods & 1 != 0;
-    // It has to type exactly this: a layout without "Ü" offers plain U for it.
-    let mut state = [0u8; 256];
-    if shift {
-        state[0x10] = 0x80; // VK_SHIFT
-    }
-    let mut out = [0u16; 4];
-    // SAFETY: buffers sized as given; flag 4 leaves the keyboard's dead-key state alone.
-    let n = unsafe {
-        let code = MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, Some(layout));
-        ToUnicodeEx(vk as u32, code, &state, &mut out, 4, Some(layout))
-    };
-    (n == 1 && out[0] == unit).then_some((vk, shift))
-}
-
-/// Presses and lets go of the key `vk` (with Shift if asked), held long enough to type.
-fn type_key(vk: u16, shift: bool, layout: HKL) {
-    // SAFETY: a plain lookup.
-    let scan = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, Some(layout)) } as u16;
-    let shift_key = Key::Scan(0x2A, false);
-    if shift {
-        send(&[keyboard(shift_key, true)]);
-        settle();
-    }
-    send(&[keyboard_input(vk, scan, KEYBD_EVENT_FLAGS(0))]);
-    std::thread::sleep(MIN_HOLD);
-    send(&[keyboard_input(vk, scan, KEYEVENTF_KEYUP)]);
-    if shift {
-        // Held past the key, as for viewers' keys: let go at once, "#" came out "3".
-        std::thread::sleep(MODIFIER_TAIL);
-        send(&[keyboard(shift_key, false)]);
-    }
-    settle();
-}
 
 fn tap(key: Key) {
     send(&[keyboard(key, true)]);
@@ -188,11 +137,23 @@ impl Injector {
             pen_device: PenDevice::Untried,
             at: None,
             routing: false,
+            native_executor: false,
+            attempted_local: false,
+            desktop: None,
+            route_initialized: false,
+            route_epoch: 1,
+            step_client: None,
             mask_win: false,
             pressed: std::collections::HashMap::new(),
             last_key: None,
         };
         this.set_displays(&[display]);
+        this
+    }
+
+    pub fn native_executor(display: u32) -> Self {
+        let mut this = Self::new(display);
+        this.native_executor = true;
         this
     }
 
@@ -278,11 +239,12 @@ impl Injector {
         if let Err(e) = unsafe { InjectSyntheticPointerInput(device.0, &[info]) } {
             // Blocked like SendInput (an elevated window, the secure desktop), or a frame
             // out of sequence.
+            STEP_RESULT.with(|r| r.set(crate::text_input::Completion::Unknown));
             tracing::debug!("input: pen {phase:?} not injected: {e}");
         }
     }
 
-    pub fn handle(&mut self, ev: Ev) {
+    fn sync_routing(&mut self) {
         // While the secure desktop is up (or an elevated window has focus), this process's
         // SendInput is refused; the SYSTEM helper injects for us. Release what the side we're
         // leaving still holds, so nothing stays stuck down across the switch.
@@ -295,6 +257,10 @@ impl Injector {
             }
             self.routing = want_route;
         }
+    }
+
+    pub fn handle(&mut self, ev: Ev) {
+        self.sync_routing();
         if self.routing {
             match ev {
                 Ev::MouseMove { x, y, stream } => {
@@ -312,6 +278,10 @@ impl Injector {
             }
             return;
         }
+        self.handle_native(ev);
+    }
+
+    fn handle_native(&mut self, ev: Ev) {
         match ev {
             Ev::MouseMove { x, y, stream } => {
                 let display = self.displays.get(stream as usize).or(self.displays.first());
@@ -485,7 +455,10 @@ impl Injector {
         }
         for button in 0..3u8 {
             if self.buttons[button as usize] {
-                self.handle(Ev::MouseUp { button });
+                // Do not re-enter handle(): this may be called while switching desktops.
+                let flag = [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTUP][button as usize];
+                send(&[mouse(0, 0, 0, flag)]);
+                self.buttons[button as usize] = false;
             }
         }
         let keys: Vec<INPUT> = std::mem::take(&mut self.held).into_iter().map(|k| keyboard(k, false)).collect();
@@ -590,9 +563,46 @@ fn keyboard_input(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     }
 }
 
+/// New executor deliberately does not follow/switch the input desktop. The worker must
+/// select and pin a route before calling; hardware/focus interference remains unsupported.
+fn send_step_count(inputs: &[INPUT]) -> usize {
+    if inputs.is_empty() { return 0; }
+    // SAFETY: fully initialized, bounded native packet.
+    unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) as usize }
+}
+
+fn send_step_packets(packets: &[crate::text_input::Packet<Key>]) -> Option<usize> {
+    use crate::text_input::Packet;
+    let inputs: Vec<_> = packets.iter().map(|&packet| match packet {
+        Packet::Key(key, down) => keyboard(key, down),
+        Packet::Mask(down) => keyboard(MASK, down),
+        Packet::Unicode(unit, down) => keyboard_input(0, unit, KEYEVENTF_UNICODE |
+            if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP }),
+    }).collect();
+    // Fresh Enter is a transient press with the same bounded hold as physical taps.
+    // Return its exact prefix count, allowing transaction's key-up-only recovery.
+    let count = if matches!(packets, [Packet::Key(Key::Scan(0x1c, false), true), Packet::Key(Key::Scan(0x1c, false), false)]) {
+        let down = send_step_count(&inputs[..1]);
+        if down == 1 {
+            std::thread::sleep(MIN_HOLD);
+            down + send_step_count(&inputs[1..])
+        } else { down }
+    } else { send_step_count(&inputs) };
+    // At most one 5ms settle per suspend/restore batch, not per modifier. The future
+    // worker may replace pacing with deadlines; urgent release waits only this step.
+    if packets.iter().any(|p| matches!(p, Packet::Key(k, _) if is_modifier(*k))) { settle(); }
+    Some(count)
+}
+
+thread_local! { static STEP_RESULT: std::cell::Cell<crate::text_input::Completion> = const { std::cell::Cell::new(crate::text_input::Completion::Completed) }; }
 fn send(inputs: &[INPUT]) {
+    let count = send_step_count(inputs);
+    if count != inputs.len() { STEP_RESULT.with(|r| r.set(crate::text_input::Completion::Unknown)); }
+}
+
+fn send_count(inputs: &[INPUT]) -> usize {
     if inputs.is_empty() {
-        return;
+        return 0;
     }
     // In the helper and the sign-in host (SYSTEM): onto whatever desktop takes input now.
     super::secure::follow_input_desktop();
@@ -602,11 +612,7 @@ fn send(inputs: &[INPUT]) {
         // Blocked: an elevated window has focus, or the secure desktop is up.
         tracing::debug!("input: SendInput sent {sent} of {}", inputs.len());
     }
-}
-
-/// Wakes the displays: a pointer nudge there and back counts as input.
-pub fn nudge() {
-    send(&[mouse(1, 0, 0, MOUSEEVENTF_MOVE), mouse(-1, 0, 0, MOUSEEVENTF_MOVE)]);
+    sent as usize
 }
 
 impl Drop for Injector {
@@ -619,14 +625,206 @@ impl Drop for Injector {
 }
 
 impl crate::media::InputSink for Injector {
+    fn execute_step(&mut self, operation: &crate::input_queue::Operation) -> crate::text_input::Completion {
+        use crate::input_queue::{Control, Operation, Physical};
+        use crate::text_input::{Completion, Packet, count_completion, scalar_packets, transaction, transient};
+        self.attempted_local = false;
+        if matches!(operation, Operation::Ownership) { return Completion::Completed; }
+        // No pipe writes or implicit release-all/desktop switch here. Task 4 must pin the
+        // route and obtain a native ACK; pipe acceptance is not native completion.
+        // Coordinate mapping belongs to the host even while a helper executes input.
+        match operation {
+            Operation::Control(Control::Configure { displays, window }) => { self.displays = displays.to_vec(); self.window = window.map(|[x,y,w,h]| Rect { x,y,w,h }); }
+            Operation::Control(Control::Displays(ids)) => self.displays = ids.to_vec(),
+            Operation::Control(Control::Display(id)) => self.displays = vec![*id],
+            Operation::Control(Control::Window(rect)) => self.window = rect.map(|[x,y,w,h]| Rect { x,y,w,h }),
+            _ => {}
+        }
+        if !self.native_executor {
+            if super::secure::is_native_host() {
+                let Some(desktop) = super::secure::input_desktop_name() else { return Completion::Unknown; };
+                let changed = self.desktop.as_ref().is_some_and(|old| old != &desktop);
+                self.desktop = Some(desktop);
+                if changed { return Completion::Unknown; }
+                super::secure::follow_input_desktop();
+            }
+            let want = super::secure::route_input();
+            if self.route_initialized && self.routing != want {
+                // Drop old execution transport: helper EOF cancels its one step and
+                // releases old executor holds. Never replay the current command.
+                self.step_client = None;
+                self.release_local();
+                self.routing = want;
+                self.route_epoch = match self.route_epoch.checked_add(1) { Some(e) => e, None => return Completion::Unknown };
+                return Completion::Unknown;
+            }
+            self.route_initialized = true; self.routing = want;
+            if want {
+                if self.step_client.is_none() { self.step_client = super::secure::StepClient::connect(self.route_epoch); }
+                let Some(client) = self.step_client.as_mut() else { return Completion::Unknown; };
+                let mapped = match operation {
+                    Operation::Control(Control::Event(Ev::MouseMove { x, y, stream })) => {
+                        let display = self.displays.get(*stream as usize).or(self.displays.first());
+                        let Some(r) = self.window.or_else(|| display.and_then(|&id| video::rect_of(id))) else { return Completion::Failed; };
+                        Operation::Control(Control::MoveAbsolute { x: (r.x + x.clamp(0.,1.) as f64 * (r.w-1.).max(0.)).round() as i32, y: (r.y + y.clamp(0.,1.) as f64 * (r.h-1.).max(0.)).round() as i32 })
+                    }
+                    Operation::Control(Control::Move { display, x, y }) => {
+                        let Some(r) = video::rect_of(*display) else { return Completion::Failed; };
+                        Operation::Control(Control::MoveAbsolute { x: (r.x + x.clamp(0.,1.) as f64 * (r.w-1.).max(0.)).round() as i32, y: (r.y + y.clamp(0.,1.) as f64 * (r.h-1.).max(0.)).round() as i32 })
+                    }
+                    _ => operation.clone(),
+                };
+                let completion = client.execute(mapped);
+                if completion == Completion::Unknown { self.step_client = None; }
+                return completion;
+            }
+        }
+        self.attempted_local = true;
+        match operation {
+            Operation::Down(physical) | Operation::Repeat(physical) | Operation::Up(physical) => {
+                let down = !matches!(operation, Operation::Up(_));
+                let result = match *physical {
+                    Physical::Key(code) => {
+                        let Some(key) = keymap::to_key(code) else { return Completion::Unsupported; };
+                        // Mask restored Alt/Win before their eventual physical release too.
+                        if !down && self.mask_win && matches!(key, LEFT_WIN | RIGHT_WIN | Key::Scan(0x38, _)) {
+                            let mask = [Packet::Mask(true), Packet::Mask(false)];
+                            if transaction::<Key>(&[], false, &mask, &[], send_step_packets) != Completion::Completed {
+                                return Completion::Unknown;
+                            }
+                        }
+                        // Bounded pacing: one physical Up waits at most 8ms; modifier
+                        // settle adds 5ms. No legacy 30ms tail or whole-message loop.
+                        if !down {
+                            if let Some(at) = self.pressed.get(&key) {
+                                if let Some(wait) = MIN_HOLD.checked_sub(at.elapsed()) { std::thread::sleep(wait); }
+                            }
+                        }
+                        let result = count_completion(Some(send_step_count(&[keyboard(key, down)])), 1);
+                        if result == Completion::Completed {
+                            if down {
+                                self.held.insert(key);
+                                self.pressed.entry(key).or_insert_with(std::time::Instant::now);
+                            } else {
+                                self.held.remove(&key);
+                                self.pressed.remove(&key);
+                            }
+                        }
+                        if is_modifier(key) { settle(); }
+                        result
+                    }
+                    Physical::Button(button) => {
+                        if button > 2 { return Completion::Unsupported; }
+                        if self.pen_ready() && button == 0 {
+                            STEP_RESULT.with(|r| r.set(Completion::Completed));
+                            self.handle_native(if down { Ev::MouseDown { button } } else { Ev::MouseUp { button } });
+                            return STEP_RESULT.with(|r| r.get());
+                        }
+                        let flags = if down { [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_RIGHTDOWN] }
+                            else { [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTUP] };
+                        let result = count_completion(Some(send_step_count(&[mouse(0, 0, 0, flags[button as usize])])), 1);
+                        if result == Completion::Completed { self.buttons[button as usize] = down; }
+                        result
+                    }
+                };
+                if !down && result != Completion::Completed { Completion::Unknown } else { result }
+            }
+            Operation::Scalar(ch) => {
+                let modifiers: Vec<Key> = self.held.iter().copied().filter(|&k| is_modifier(k)).collect();
+                let menu = modifiers.iter().any(|k| matches!(*k, LEFT_WIN | RIGHT_WIN | Key::Scan(0x38, _)));
+                let enter = Key::Scan(0x1c, false);
+                let held_enter = self.held.contains(&enter);
+                let payload = if *ch == '\n' { transient(enter, held_enter) } else { scalar_packets(*ch) };
+                let protected = if *ch == '\n' && held_enter { vec![enter] } else { vec![] };
+                // Atomic relative to other steps: restore THIS aggregate, then return so
+                // an urgent release can run before another scalar. No semantic backlog.
+                let result = transaction(&modifiers, menu, &payload, &protected, send_step_packets);
+                self.mask_win |= menu;
+                result
+            }
+            // Paste must own transient V; display reset must invalidate scheduler holds.
+            // Motion/scroll/pen adapters still need checked native results in Task 3.
+            Operation::Control(control) => {
+                STEP_RESULT.with(|r| r.set(Completion::Completed));
+                match control {
+                    Control::MoveAbsolute { x, y } => self.move_abs(*x, *y),
+                    Control::Reset => { self.release_local(); return STEP_RESULT.with(|r| r.get()); }
+                    Control::Configure { displays, window } => {
+                        let result = self.execute_step(&Operation::Control(Control::Displays(displays.clone())));
+                        if result != Completion::Completed { return result; }
+                        return self.execute_step(&Operation::Control(Control::Window(*window)));
+                    }
+                    Control::Display(id) => self.displays = vec![*id],
+                    Control::Displays(ids) => self.displays = ids.to_vec(),
+                    Control::Window(rect) => self.window = rect.map(|[x,y,w,h]| Rect { x,y,w,h }),
+                    Control::Move { display, x, y } => {
+                        let Some(r) = video::rect_of(*display) else { return Completion::Failed; };
+                        self.move_in(r, *x, *y);
+                    }
+                    Control::Event(ev) => {
+                        if matches!(ev, Ev::Gamepad { .. }) { crate::gamepad::handle(*ev); }
+                        else { self.handle_native(*ev); }
+                    }
+                    Control::Paste => {
+                        let ctrl = Key::Scan(0x1d, false);
+                        let v = Key::Scan(0x2f, false);
+                        let wins: Vec<_> = [LEFT_WIN, RIGHT_WIN].into_iter().filter(|k| self.held.contains(k)).collect();
+                        let mut payload = vec![];
+                        if !self.held.contains(&ctrl) { payload.push(Packet::Key(ctrl, true)); }
+                        payload.extend(transient(v, self.held.contains(&v)));
+                        if !self.held.contains(&ctrl) { payload.push(Packet::Key(ctrl, false)); }
+                        let protected = if self.held.contains(&v) { vec![v] } else { vec![] };
+                        self.mask_win |= !wins.is_empty();
+                        return transaction(&wins, !wins.is_empty(), &payload, &protected, |packets| {
+                            // Keep the existing paste tap's minimum hold while retaining
+                            // exact prefix counts for release-only partial recovery.
+                            let mut sent = 0;
+                            for packet in packets {
+                                let n = send_step_packets(std::slice::from_ref(packet))?;
+                                sent += n;
+                                if n != 1 { return Some(sent); }
+                                if matches!(packet, Packet::Key(k, true) if *k == v) && !self.held.contains(&v) { std::thread::sleep(MIN_HOLD); }
+                            }
+                            Some(sent)
+                        });
+                    }
+                }
+                STEP_RESULT.with(|r| r.get())
+            },
+            Operation::Ownership => Completion::Completed,
+        }
+    }
+
     fn handle(&mut self, ev: Ev) {
         Injector::handle(self, ev)
     }
     fn paste(&mut self) {
         Injector::paste(self)
     }
+    fn recover_step(&mut self, operation: &crate::input_queue::Operation) {
+        use crate::input_queue::{Operation, Physical};
+        if self.routing && !self.native_executor {
+            // Dropping the pinned connection triggers old-helper release on EOF. Never
+            // open a replacement connection to replay a possibly attempted step.
+            self.step_client = None;
+        } else if self.attempted_local && let Operation::Down(physical) = operation {
+            match *physical {
+                Physical::Key(code) => { if let Some(key) = keymap::to_key(code) { send_step_count(&[keyboard(key, false)]); } }
+                Physical::Button(button) if button < 3 => { send_step_count(&[mouse(0,0,0,[MOUSEEVENTF_LEFTUP,MOUSEEVENTF_MIDDLEUP,MOUSEEVENTF_RIGHTUP][button as usize])]); }
+                _ => {}
+            }
+        }
+        self.release_local();
+    }
+    fn reset_state(&mut self) -> crate::text_input::Completion {
+        if let Some(client) = self.step_client.as_mut() { return client.execute(crate::input_queue::Operation::Control(crate::input_queue::Control::Reset)); }
+        STEP_RESULT.with(|r| r.set(crate::text_input::Completion::Completed));
+        self.release_local();
+        STEP_RESULT.with(|r| r.get())
+    }
     fn release_all(&mut self) {
-        Injector::release_all(self)
+        self.step_client = None;
+        self.release_local();
     }
     fn set_displays(&mut self, displays: &[u32]) {
         Injector::set_displays(self, displays)
@@ -639,38 +837,60 @@ impl crate::media::InputSink for Injector {
             self.move_in(r, x, y);
         }
     }
-    /// Any text: each character the keyboard layout has, typed as its key (with Shift if
-    /// it needs it), and others as Unicode key events. Apps read a Unicode key's character
-    /// when they get round to it, and a burst of them sent at once came out as the last
-    /// character over and over (Notepad, in the VM); real keys always type what they are.
+    /// Resolved text uses Unicode packets, independent of the foreground layout.
+    /// Newline remains an explicit Enter action for compatibility. Do not sleep between
+    /// Unicode scalars: this runs on the same path as queued key releases.
     fn type_text(&mut self, text: &str) -> bool {
-        // On the secure desktop (e.g. typing a password at the lock screen) injection goes
-        // through the helper, which has no Unicode path; let the caller press keys instead.
-        if super::secure::route_input() {
-            return false;
-        }
-        let layout = foreground_layout();
-        let units: Vec<u16> = text.encode_utf16().collect();
-        let mut i = 0;
-        while i < units.len() {
-            let unit = units[i];
-            if unit == '\n' as u16 {
-                // Newlines as Enter: apps read Return from the key, not the character.
-                tap(Key::Scan(0x1C, false));
-            } else if let Some((vk, shift)) = layout_key(unit, layout) {
-                type_key(vk, shift, layout);
-            } else {
-                let pair = (0xD800..0xDC00).contains(&unit) && i + 1 < units.len();
-                let chars = if pair { vec![unit, units[i + 1]] } else { vec![unit] };
-                let mut inputs: Vec<INPUT> = chars.iter().map(|&u| keyboard_input(0, u, KEYEVENTF_UNICODE)).collect();
-                inputs.extend(chars.iter().map(|&u| keyboard_input(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)));
-                send(&inputs);
-                std::thread::sleep(UNICODE_GAP);
-                if pair {
-                    i += 1;
-                }
+        self.sync_routing();
+        // Text follows keys onto the helper's injection thread, including elevated windows.
+        if self.routing {
+            if !super::secure::type_text(text) {
+                tracing::debug!("input: helper disconnected while sending text");
             }
-            i += 1;
+            // A transport failure must not retry as US-layout keys in a different window.
+            return true;
+        }
+        super::secure::follow_input_desktop();
+        // Viewer text is already resolved, even if an earlier physical chord or another
+        // viewer left modifiers down. Restore our logical held state after this insertion.
+        let modifiers: Vec<Key> = self.held.iter().copied().filter(|k| is_modifier(*k)).collect();
+        let menu_modifier = modifiers.iter().any(|k| matches!(*k, LEFT_WIN | RIGHT_WIN | Key::Scan(0x38, _)));
+        if menu_modifier {
+            send(&[keyboard(MASK, true), keyboard(MASK, false)]);
+            self.mask_win |= modifiers.iter().any(|k| matches!(*k, LEFT_WIN | RIGHT_WIN));
+        }
+        send(&modifiers.iter().map(|&k| keyboard(k, false)).collect::<Vec<_>>());
+        if !modifiers.is_empty() {
+            settle();
+        }
+        for ch in text.chars() {
+            if ch == '\n' {
+                // Explicit action policy, not a claim of Unicode equivalence.
+                tap(Key::Scan(0x1C, false));
+                continue;
+            }
+            let events = crate::text_input::unicode_events(ch);
+            let packet = |events: &[(u16, bool)]| -> Vec<INPUT> {
+                events.iter().map(|&(unit, down)| keyboard_input(0, unit,
+                    KEYEVENTF_UNICODE | if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP }
+                )).collect()
+            };
+            let inputs = packet(&events);
+            let inserted = send_count(&inputs);
+            if inserted != inputs.len() {
+                // Best-effort release only. Retrying the scalar or the whole text can
+                // duplicate characters already accepted before UIPI/focus changed.
+                send(&packet(&crate::text_input::pending_releases(&events, inserted)));
+                break;
+            }
+        }
+        send(&modifiers.iter().map(|&k| keyboard(k, true)).collect::<Vec<_>>());
+        if menu_modifier {
+            // Restored Alt/Win must not look like a standalone press when later released.
+            send(&[keyboard(MASK, true), keyboard(MASK, false)]);
+        }
+        if !modifiers.is_empty() {
+            settle();
         }
         true
     }

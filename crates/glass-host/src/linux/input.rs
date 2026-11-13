@@ -28,6 +28,7 @@ pub fn has_accessibility() -> bool {
 }
 
 pub struct Injector {
+    step_result: crate::text_input::Completion,
     keyboard: Option<VirtualDevice>,
     pointer: Option<VirtualDevice>,
     /// Logical rect of each streamed display, by stream number.
@@ -46,6 +47,7 @@ pub struct Injector {
 impl Injector {
     pub fn new(display: u32) -> Self {
         let mut this = Self {
+            step_result: crate::text_input::Completion::Completed,
             keyboard: None,
             pointer: None,
             bounds: Vec::new(),
@@ -244,6 +246,7 @@ impl Injector {
         if let Some(kb) = self.keyboard.as_mut()
             && let Err(e) = kb.emit(&[InputEvent::new(EventType::KEY.0, code, down as i32)])
         {
+            self.step_result = crate::text_input::Completion::Unknown;
             tracing::warn!("input: keyboard emit failed: {e}");
         }
     }
@@ -252,6 +255,7 @@ impl Injector {
         if let Some(p) = self.pointer.as_mut()
             && let Err(e) = p.emit(events)
         {
+            self.step_result = crate::text_input::Completion::Unknown;
             tracing::warn!("input: pointer emit failed: {e}");
         }
     }
@@ -288,6 +292,107 @@ fn build_devices() -> std::io::Result<(VirtualDevice, VirtualDevice)> {
 }
 
 impl crate::media::InputSink for Injector {
+    fn execute_step(&mut self, operation: &crate::input_queue::Operation) -> crate::text_input::Completion {
+        use crate::input_queue::{Control, Operation, Physical};
+        use crate::text_input::{Completion, Packet, fallback_packets, transaction};
+        // Permissions may have been granted since startup. Recreate only an empty
+        // executor: never replace a device behind scheduler-owned physical holds.
+        if self.keyboard.is_none() && self.pointer.is_none() && self.held.is_empty() && !self.buttons.iter().any(|b| *b) { self.ensure_devices(); }
+        match operation {
+            Operation::Ownership => Completion::Completed,
+            Operation::Control(control) => {
+                match control {
+                    Control::MoveAbsolute { .. } => return Completion::Unsupported,
+                    Control::Reset => return self.reset_state(),
+                    Control::Configure { displays, window } => {
+                        let result = self.execute_step(&Operation::Control(Control::Displays(displays.clone())));
+                        if result != Completion::Completed { return result; }
+                        return self.execute_step(&Operation::Control(Control::Window(*window)));
+                    }
+                    Control::Display(id) => { self.bounds = video::rect_of(*id).into_iter().collect(); self.layout = video::layout_rect(); }
+                    Control::Displays(ids) => { self.bounds = ids.iter().filter_map(|id| video::rect_of(*id)).collect(); self.layout = video::layout_rect(); }
+                    Control::Window(rect) => { if let Some([x, y, w, h]) = rect { self.bounds = vec![Rect { x: *x, y: *y, w: *w, h: *h }]; } }
+                    Control::Paste => {
+                        let ctrl = self.held.contains(&KEY_LEFTCTRL);
+                        let v = self.held.contains(&KEY_V);
+                        let modifiers: Vec<u16> = [KEY_LEFTMETA, KEY_RIGHTMETA].into_iter().filter(|k| self.held.contains(k)).collect();
+                        let mut payload = vec![];
+                        if !ctrl { payload.push(Packet::Key(KEY_LEFTCTRL, true)); }
+                        payload.extend(crate::text_input::transient(KEY_V, v));
+                        if !ctrl { payload.push(Packet::Key(KEY_LEFTCTRL, false)); }
+                        let protected = if v { vec![KEY_V] } else { vec![] };
+                        let Some(device) = self.keyboard.as_mut() else { return Completion::Failed; };
+                        return transaction(&modifiers, false, &payload, &protected, |packets| {
+                            let events: Vec<_> = packets.iter().map(|p| match *p { Packet::Key(code, down) => InputEvent::new(EventType::KEY.0, code, down as i32), _ => unreachable!() }).collect();
+                            device.emit(&events).ok().map(|_| packets.len())
+                        });
+                    }
+                    Control::Move { display, x, y } => {
+                        if self.pointer.is_none() { return Completion::Failed; }
+                        let Some(rect) = video::rect_of(*display) else { return Completion::Failed; };
+                        self.step_result = Completion::Completed;
+                        self.move_in(rect, *x, *y);
+                        return self.step_result;
+                    }
+                    Control::Event(ev) => {
+                        if matches!(ev, Ev::Gamepad { .. }) { crate::gamepad::handle(*ev); return Completion::Completed; }
+                        if self.pointer.is_none() { return Completion::Failed; }
+                        self.step_result = Completion::Completed;
+                        self.handle(*ev);
+                        return self.step_result;
+                    }
+                }
+                Completion::Completed
+            },
+            Operation::Down(physical) | Operation::Repeat(physical) | Operation::Up(physical) => {
+                let down = !matches!(operation, Operation::Up(_));
+                let repeat = matches!(operation, Operation::Repeat(_));
+                let (device, code) = match *physical {
+                    Physical::Key(k) => {
+                        let Some(code) = keymap::to_evdev(k) else { return Completion::Unsupported; };
+                        (&mut self.keyboard, code)
+                    }
+                    Physical::Button(b) if b < 3 => (&mut self.pointer, [BTN_LEFT, BTN_MIDDLE, BTN_RIGHT][b as usize]),
+                    _ => return Completion::Unsupported,
+                };
+                let Some(device) = device.as_mut() else { return Completion::Failed; };
+                // emit adds SYN_REPORT. An error can follow a partial write: no prefix
+                // count is available, so never claim Failed/no effect or retry it.
+                let value = if repeat && matches!(physical, Physical::Key(_)) { 2 } else { down as i32 };
+                if device.emit(&[InputEvent::new(EventType::KEY.0, code, value)]).is_err() { return Completion::Unknown; }
+                match *physical {
+                    Physical::Key(_) => { if down { self.held.insert(code); } else { self.held.remove(&code); } }
+                    Physical::Button(b) => self.buttons[b as usize] = down,
+                }
+                Completion::Completed
+            }
+            Operation::Scalar(ch) => {
+                // Choose the US-layout adapter before any input, not after Unicode failure.
+                // Only transient keys are released; existing physical keys stay owned.
+                let Some((payload, protected)) = fallback_packets(*ch, |k| keymap::to_evdev(k).is_some_and(|code| self.held.contains(&code))) else {
+                    return Completion::Unsupported;
+                };
+                let modifiers: Vec<u16> = (0x36..=0x3e).filter(|&k| k != 0x39)
+                    .filter(|&k| keymap::to_evdev(k).is_some_and(|code| self.held.contains(&code))).collect();
+                let Some(device) = self.keyboard.as_mut() else { return Completion::Failed; };
+                transaction(&modifiers, false, &payload, &protected, |packets| {
+                    let events: Option<Vec<_>> = packets.iter().map(|p| match *p {
+                        Packet::Key(k, down) => keymap::to_evdev(k).map(|code| InputEvent::new(EventType::KEY.0, code,
+                            if down && protected.contains(&k) { 2 } else { down as i32 })),
+                        _ => None,
+                    }).collect();
+                    let events = events?;
+                    device.emit(&events).ok().map(|_| packets.len())
+                })
+            }
+        }
+    }
+
+    fn reset_state(&mut self) -> crate::text_input::Completion {
+        self.step_result = crate::text_input::Completion::Completed;
+        self.release_all();
+        self.step_result
+    }
     fn handle(&mut self, ev: glass_proto::InputEvent) {
         Injector::handle(self, ev)
     }
@@ -306,5 +411,42 @@ impl crate::media::InputSink for Injector {
         if let Some(r) = video::rect_of(display) {
             self.move_in(r, x, y);
         }
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+    use crate::input_queue::{Control, Operation, Physical};
+    use crate::media::InputSink;
+    use crate::text_input::Completion;
+
+    fn unavailable() -> Injector {
+        Injector {
+            step_result: crate::text_input::Completion::Completed,
+            keyboard: None, pointer: None, bounds: Vec::new(), layout: Rect::default(),
+            held: HashSet::from([KEY_LEFTCTRL]), buttons: [true, false, false],
+            wheel: (0.0, 0.0), hi_res: (0.0, 0.0), pos: (0.0, 0.0),
+        }
+    }
+    #[test]
+    fn configuration_does_not_reset_native_holds_behind_scheduler() {
+        let mut input = unavailable();
+        for control in [Control::Window(None)] {
+            assert_eq!(input.execute_step(&Operation::Control(control)), Completion::Completed);
+            assert!(input.held.contains(&KEY_LEFTCTRL));
+            assert!(input.buttons[0]);
+        }
+    }
+    #[test]
+    fn unavailable_device_is_failure_not_unsupported_or_completed() {
+        let mut input = unavailable();
+        assert_eq!(input.execute_step(&Operation::Down(Physical::Key(0))), Completion::Failed);
+        assert_eq!(input.execute_step(&Operation::Up(Physical::Button(0))), Completion::Failed);
+        assert_eq!(input.execute_step(&Operation::Scalar('a')), Completion::Failed);
+        assert_eq!(input.execute_step(&Operation::Scalar('😀')), Completion::Unsupported);
+        assert_eq!(input.execute_step(&Operation::Ownership), Completion::Completed);
+        assert_eq!(input.held, HashSet::from([KEY_LEFTCTRL]));
+        assert!(input.buttons[0]);
     }
 }

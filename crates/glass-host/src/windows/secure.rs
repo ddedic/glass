@@ -201,6 +201,25 @@ pub fn send_input(ev: &Ev) -> bool {
     send(OP_INPUT, &ev.write())
 }
 
+/// Text uses the same input opcodes as keys. Write every chunk under one pipe lock so
+/// another command cannot land between a piece's chunks.
+pub fn type_text(text: &str) -> bool {
+    let packet = text_packet(text);
+    match packet.split_first() {
+        Some((&op, payload)) => send(op, payload),
+        None => true,
+    }
+}
+
+fn text_packet(text: &str) -> Vec<u8> {
+    let mut packet = Vec::new();
+    for ev in glass_proto::text_events(text) {
+        packet.push(OP_INPUT);
+        packet.extend_from_slice(&ev.write());
+    }
+    packet
+}
+
 pub fn move_abs(x: i32, y: i32) -> bool {
     let mut p = [0u8; 8];
     p[0..4].copy_from_slice(&x.to_le_bytes());
@@ -232,14 +251,6 @@ pub fn set_bitrate(bps: u32) {
 
 // ---- Helper side (runs as LocalSystem in the active console session) ----
 
-/// What the pipe-serving thread hands to the injection thread, which owns the Injector and
-/// stays on the input desktop.
-enum InputCmd {
-    Event(Ev),
-    MoveAbs(i32, i32),
-    Release,
-}
-
 /// The whole life of the SYSTEM helper: create the strict-ACL pipe, then serve the per-user
 /// host — inject on the input desktop, run SendSAS, and stream the secure desktop back.
 pub fn run_helper() -> anyhow::Result<()> {
@@ -248,9 +259,12 @@ pub fn run_helper() -> anyhow::Result<()> {
     super::dpi_aware();
     IS_HELPER.store(true, Ordering::SeqCst);
     log_helper("secure helper: starting");
+    std::thread::Builder::new().name("glass-step-server".into()).spawn(|| {
+        if let Err(e) = run_step_server() { log_helper(&format!("native execution transport stopped: {e}")); }
+    })?;
     let sd = security_descriptor();
     loop {
-        let pipe = Arc::new(create_pipe(&sd)?);
+        let pipe = Arc::new(create_pipe(&sd, PIPE)?);
         if !pipe.connect() {
             continue;
         }
@@ -272,10 +286,6 @@ fn serve(pipe: Arc<Pipe>) {
         return;
     }
 
-    // Injection runs on its own thread, which stays on the input desktop.
-    let (tx, rx) = std::sync::mpsc::channel::<InputCmd>();
-    let inject = std::thread::Builder::new().name("glass-inject".into()).spawn(move || inject_loop(rx)).ok();
-
     // The host's pipe for this connection: capture frames are forwarded here while enabled.
     let writer = Arc::new(Mutex::new(pipe.clone()));
 
@@ -285,27 +295,6 @@ fn serve(pipe: Arc<Pipe>) {
             break;
         }
         match op[0] {
-            OP_INPUT => {
-                let mut buf = [0u8; glass_proto::INPUT_EVENT_LEN];
-                if reader.read_exact(&mut buf).is_err() {
-                    break;
-                }
-                if let Some(ev) = Ev::read(&buf) {
-                    let _ = tx.send(InputCmd::Event(ev));
-                }
-            }
-            OP_MOVE_ABS => {
-                let mut buf = [0u8; 8];
-                if reader.read_exact(&mut buf).is_err() {
-                    break;
-                }
-                let x = i32::from_le_bytes(buf[0..4].try_into().unwrap());
-                let y = i32::from_le_bytes(buf[4..8].try_into().unwrap());
-                let _ = tx.send(InputCmd::MoveAbs(x, y));
-            }
-            OP_RELEASE => {
-                let _ = tx.send(InputCmd::Release);
-            }
             OP_SAS => {
                 send_sas_now();
             }
@@ -342,10 +331,6 @@ fn serve(pipe: Arc<Pipe>) {
         }
     }
     capture_detach(); // this host is gone; stop forwarding to its (now dead) pipe
-    drop(tx); // ends the injection thread
-    if let Some(inject) = inject {
-        let _ = inject.join();
-    }
     log_helper("secure helper: host disconnected");
 }
 
@@ -430,22 +415,6 @@ fn write_frame(writer: &Mutex<Arc<Pipe>>, frame: &EncodedFrame) -> bool {
     w.write_all(&header).and_then(|_| w.write_all(&frame.data)).is_ok()
 }
 
-/// The injection thread: keeps itself on the input desktop (which changes when the lock
-/// screen or a UAC prompt appears) and injects what the host sends.
-fn inject_loop(rx: std::sync::mpsc::Receiver<InputCmd>) {
-    // Stream 0 is the helper's main-display capture, which is what viewers see while locked.
-    let mut injector = super::input::Injector::new(0);
-    while let Ok(cmd) = rx.recv() {
-        retarget_input_desktop();
-        match cmd {
-            InputCmd::Event(ev) => injector.handle(ev),
-            InputCmd::MoveAbs(x, y) => injector.move_abs(x, y),
-            InputCmd::Release => injector.release_all(),
-        }
-    }
-    injector.release_all();
-}
-
 /// Set once this process is the SYSTEM helper, so shared capture code (video.rs) knows to
 /// put its capture threads on the input desktop — needed to duplicate the secure desktop.
 static IS_HELPER: AtomicBool = AtomicBool::new(false);
@@ -458,6 +427,8 @@ pub fn mark_helper() {
 
 /// Called by each capture thread (video.rs): in the helper, follow the input desktop so
 /// DXGI duplication can see the lock screen / UAC desktop; a no-op in the per-user host.
+pub(super) fn is_native_host() -> bool { IS_HELPER.load(Ordering::Relaxed) }
+
 pub fn follow_input_desktop() {
     if IS_HELPER.load(Ordering::Relaxed) {
         retarget_input_desktop();
@@ -559,7 +530,7 @@ impl Drop for SecurityDescriptor {
 }
 
 /// Creates the pipe instance, with the strict ACL and remote clients rejected.
-fn create_pipe(sd: &SecurityDescriptor) -> anyhow::Result<Pipe> {
+fn create_pipe(sd: &SecurityDescriptor, name: &str) -> anyhow::Result<Pipe> {
     use windows::Win32::Security::SECURITY_ATTRIBUTES;
     use windows::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -573,7 +544,7 @@ fn create_pipe(sd: &SecurityDescriptor) -> anyhow::Result<Pipe> {
     // SAFETY: a NUL-terminated name and a security descriptor that outlives this call.
     let handle = unsafe {
         CreateNamedPipeW(
-            &windows::core::HSTRING::from(PIPE),
+            &windows::core::HSTRING::from(name),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
@@ -728,10 +699,123 @@ fn token_user_sid(token: windows::Win32::Foundation::HANDLE) -> Option<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn helper_text_packets_reassemble_unicode_in_order() {
+        let packet = super::text_packet("@č\u{1f600}@č\u{1f600}");
+        assert!(packet.len() > 1 + glass_proto::INPUT_EVENT_LEN);
+        let mut reader = glass_proto::TextReader::default();
+        let mut result = Vec::new();
+        for record in packet.chunks_exact(1 + glass_proto::INPUT_EVENT_LEN) {
+            assert_eq!(record[0], super::OP_INPUT);
+            let event = glass_proto::InputEvent::read(record[1..].try_into().unwrap()).unwrap();
+            if let Some(text) = reader.push(&event) {
+                result.push(text);
+            }
+        }
+        assert_eq!(result, ["@č\u{1f600}@č\u{1f600}"]);
+        assert!(super::text_packet("").is_empty());
+    }
+
+    #[test]
     fn the_handshake_names_this_version() {
         let h = super::handshake();
         let text = String::from_utf8_lossy(&h);
         assert!(text.starts_with(&format!("GLASS {}", env!("CARGO_PKG_VERSION"))), "{text}");
         assert_eq!(h.len(), super::HANDSHAKE_LEN);
+    }
+}
+
+// Native execution has a distinct bounded transport. Capture frame writes, even when
+// stalled, cannot hold this pipe's writer or delay its completion acknowledgement.
+const STEP_PIPE: &str = r"\\.\pipe\glass-secure-step-v1";
+const STEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub struct StepClient { client: crate::input_protocol::Client<Pipe> }
+impl crate::input_protocol::Transport for Pipe {
+    fn exchange(&mut self, request: &[u8; crate::input_protocol::REQUEST_LEN], deadline: std::time::Instant) -> Result<[u8; crate::input_protocol::ACK_LEN], ()> {
+        let mut reply = [0; crate::input_protocol::ACK_LEN];
+        self.write_until(request, deadline).map_err(|_| ())?;
+        self.read_until(&mut reply, deadline).map_err(|_| ())?;
+        Ok(reply)
+    }
+    fn cancel(&mut self) { Pipe::cancel(self); }
+}
+impl StepClient {
+    pub fn connect(epoch: u64) -> Option<Self> {
+        let pipe = Pipe::open(STEP_PIPE).ok()?;
+        if !owned_by_system(pipe.handle()) { return None; }
+        let mut hello = [0; HANDSHAKE_LEN];
+        pipe.read_until(&mut hello, std::time::Instant::now() + STEP_DEADLINE).ok()?;
+        if hello != handshake() { return None; }
+        Some(Self { client: crate::input_protocol::Client::new(pipe, epoch) })
+    }
+    pub fn execute(&mut self, operation: crate::input_queue::Operation) -> crate::text_input::Completion { self.client.execute(operation) }
+}
+
+fn run_step_server() -> anyhow::Result<()> {
+    use windows::Win32::System::Pipes::DisconnectNamedPipe;
+    loop {
+        let sd = security_descriptor();
+        let pipe = Arc::new(create_pipe(&sd, STEP_PIPE)?);
+        if !pipe.connect() { continue; }
+        if client_check(pipe.handle()).is_ok() { serve_steps(pipe.clone()); }
+        let _ = unsafe { DisconnectNamedPipe(pipe.handle()) };
+    }
+}
+fn serve_steps(pipe: Arc<Pipe>) {
+    use crate::{input_protocol::{Request, Ack, REQUEST_LEN}, media::InputSink, text_input::Completion};
+    if pipe.write_until(&handshake(), std::time::Instant::now() + STEP_DEADLINE).is_err() { return; }
+    let session = Arc::new(crate::input_protocol::HelperSession::default());
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Request>(1);
+    let worker_pipe = pipe.clone(); let stopped = session.clone();
+    let worker = std::thread::spawn(move || {
+        let mut injector = super::input::Injector::native_executor(0);
+        let mut desktop = None;
+        while let Ok(request) = rx.recv() {
+            if !stopped.can_execute() { break; }
+            let current = input_desktop_name();
+            let changed = current.is_none() || desktop.as_ref().is_some_and(|old| Some(old) != current.as_ref());
+            let completion = if changed {
+                // Best effort on the previous executor before changing thread desktop.
+                injector.release_all();
+                Completion::Unknown
+            } else {
+                desktop = current;
+                retarget_input_desktop();
+                injector.execute_step(&request.operation)
+            };
+            // EOF takes effect out of band, even if a native call finished late.
+            if !stopped.can_execute() { break; }
+            let ack = Ack { epoch: request.epoch, sequence: request.sequence, completion };
+            stopped.completed();
+            if worker_pipe.write_until(&ack.encode(), std::time::Instant::now() + STEP_DEADLINE).is_err() { stopped.cancel(); worker_pipe.cancel(); break; }
+            if completion == Completion::Unknown { stopped.cancel(); worker_pipe.cancel(); break; }
+        }
+        injector.release_all();
+    });
+    loop {
+        let mut bytes = [0; REQUEST_LEN];
+        if (&*pipe).read_exact(&mut bytes).is_err() { break; }
+        let Some(request) = Request::decode(&bytes) else { break; };
+        if !session.admit(&request) { break; }
+        if tx.try_send(request).is_err() { break; }
+    }
+    session.cancel();
+    pipe.cancel();
+    drop(tx);
+    let _ = worker.join();
+}
+
+/// Desktop identity is only an invalidation hint, never a foreground-window pin.
+pub(super) fn input_desktop_name() -> Option<Vec<u16>> {
+    use windows::Win32::{Foundation::HANDLE, System::StationsAndDesktops::{OpenInputDesktop, CloseDesktop, GetUserObjectInformationW, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, UOI_NAME}};
+    unsafe {
+        let desktop = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS).ok()?;
+        let mut name = [0u16; 256];
+        let mut needed = 0;
+        let result = GetUserObjectInformationW(HANDLE(desktop.0), UOI_NAME, Some(name.as_mut_ptr().cast()), std::mem::size_of_val(&name) as u32, Some(&mut needed));
+        let _ = CloseDesktop(desktop);
+        result.ok()?;
+        if needed == 0 || needed as usize > std::mem::size_of_val(&name) { return None; }
+        Some(name[..needed as usize / 2].to_vec())
     }
 }

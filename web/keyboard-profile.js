@@ -6,7 +6,7 @@ export const PROFILE_PREFIX = 'glass.keyboard.';
 
 /** Defaults: PC keyboards map Ctrl to ⌘ on a Mac; on a Linux or Windows host keys go as typed. */
 export function defaultProfile({ hostOs = 'macos', isPC = false } = {}) {
-  return { pc: hostOs === 'macos' && isPC, ctrlAsCmd: hostOs === 'macos', swap: false };
+  return { pc: hostOs === 'macos' && isPC, ctrlAsCmd: hostOs === 'macos', swap: false, physical: false, optionAsAlt: false };
 }
 
 /** The profile for `host`: saved for it, else `fallback` (last used), else the defaults. */
@@ -26,10 +26,12 @@ export function loadProfile(get, host, { fallback, hostOs, isPC } = {}) {
     pc: Boolean(source.pc ?? base.pc),
     ctrlAsCmd: Boolean(source.ctrlAsCmd ?? base.ctrlAsCmd),
     swap: Boolean(source.swap ?? base.swap),
+    physical: Boolean(source.physical ?? base.physical),
+    optionAsAlt: Boolean(source.optionAsAlt ?? base.optionAsAlt),
     saved: Boolean(saved),
   };
 }
 
-export function saveProfile(set, host, { pc, ctrlAsCmd, swap }) {
-  set(PROFILE_PREFIX + host, JSON.stringify({ pc, ctrlAsCmd, swap }));
+export function saveProfile(set, host, { pc, ctrlAsCmd, swap, physical = false, optionAsAlt = false }) {
+  set(PROFILE_PREFIX + host, JSON.stringify({ pc, ctrlAsCmd, swap, physical, optionAsAlt }));
 }

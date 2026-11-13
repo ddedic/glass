@@ -76,6 +76,9 @@ pub struct Injector {
     pos: CGPoint,
     buttons: [bool; 3],
     flags: CGEventFlags,
+    held: std::collections::BTreeSet<u16>,
+    #[cfg(test)]
+    test_key_events: Option<Vec<(u16, bool)>>,
     last_click: Option<(u8, std::time::Instant, CGPoint)>,
     click_count: i64,
     /// Relative motion for the next move event (games read these, not the position).
@@ -114,6 +117,9 @@ impl Injector {
             pos: CGDisplayBounds(display).origin,
             buttons: [false; 3],
             flags: CGEventFlags(0),
+            held: std::collections::BTreeSet::new(),
+            #[cfg(test)]
+            test_key_events: None,
             last_click: None,
             click_count: 1,
             delta: (0, 0),
@@ -202,12 +208,12 @@ impl Injector {
             InputEvent::Gamepad { .. } | InputEvent::Text { .. } => {}
             InputEvent::KeyDown { keycode } | InputEvent::KeyUp { keycode } => {
                 let down = matches!(ev, InputEvent::KeyDown { .. });
-                if let Some(flag) = modifier_flag(keycode) {
-                    self.flags = if down {
-                        CGEventFlags(self.flags.0 | flag.0)
-                    } else {
-                        CGEventFlags(self.flags.0 & !flag.0)
-                    };
+                if down { self.held.insert(keycode); } else { self.held.remove(&keycode); }
+                self.flags = aggregate_flags(&self.held);
+                #[cfg(test)]
+                if let Some(events) = self.test_key_events.as_mut() {
+                    events.push((keycode, down));
+                    return;
                 }
                 let ev = CGEvent::new_keyboard_event(self.source.as_deref(), keycode, down);
                 self.post(ev);
@@ -229,8 +235,9 @@ impl Injector {
     /// Types `text` whatever the keyboard layout: key events carrying the characters
     /// themselves, a few at a time (apps drop longer strings per event).
     pub fn type_text(&mut self, text: &str) {
-        let units: Vec<u16> = text.encode_utf16().collect();
-        for chunk in units.chunks(16) {
+        let flags = self.flags;
+        self.flags = CGEventFlags(0);
+        for chunk in unicode_chunks(text) {
             for down in [true, false] {
                 let ev = CGEvent::new_keyboard_event(self.source.as_deref(), 0, down);
                 // SAFETY: `chunk` outlives the call, and its length is passed with it.
@@ -239,6 +246,7 @@ impl Injector {
             }
             std::thread::sleep(std::time::Duration::from_millis(4));
         }
+        self.flags = flags;
     }
 
     /// Pastes the clipboard: Cmd+V, using the Cmd the client is already holding.
@@ -259,19 +267,11 @@ impl Injector {
                 self.handle(InputEvent::MouseUp { button });
             }
         }
-        for keycode in [
-            KVK_COMMAND,
-            KVK_SHIFT,
-            KVK_OPTION,
-            KVK_CONTROL,
-            KVK_RIGHT_COMMAND,
-            KVK_RIGHT_SHIFT,
-            KVK_RIGHT_OPTION,
-            KVK_RIGHT_CONTROL,
-        ] {
-            if modifier_flag(keycode).is_some_and(|f| self.flags.0 & f.0 != 0) {
-                self.handle(InputEvent::KeyUp { keycode });
-            }
+        // Reset must release nonmodifiers too: the dispatcher retires every old
+        // generation, so a later physical Up cannot repair an omitted native hold.
+        let held: Vec<_> = self.held.iter().copied().collect();
+        for keycode in held {
+            self.handle(InputEvent::KeyUp { keycode });
         }
     }
 
@@ -332,19 +332,27 @@ impl Injector {
     }
 
     fn post(&self, ev: Option<CFRetained<CGEvent>>) {
-        if let Some(ev) = ev {
-            declare_user_active();
-            CGEvent::set_flags(Some(&ev), self.flags);
-            // Lets privacy mode's event tap tell these from the local keyboard and mouse.
-            CGEvent::set_integer_value_field(
-                Some(&ev),
-                CGEventField(super::privacy::USER_DATA_FIELD),
-                super::privacy::INJECTED_MARK,
-            );
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&ev));
-            super::front::injected();
-        }
+        if let Some(ev) = ev { self.post_with_flags(ev, self.flags); }
+        else { STEP_RESULT.with(|r| r.set(crate::text_input::Completion::Unknown)); }
     }
+
+    fn post_with_flags(&self, ev: CFRetained<CGEvent>, flags: CGEventFlags) {
+        declare_user_active();
+        CGEvent::set_flags(Some(&ev), flags);
+        CGEvent::set_integer_value_field(Some(&ev), CGEventField(super::privacy::USER_DATA_FIELD), super::privacy::INJECTED_MARK);
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&ev));
+        super::front::injected();
+    }
+
+}
+
+/// CGEvent strings are short, but a UTF-16 surrogate pair must stay in one event.
+fn unicode_chunks(text: &str) -> Vec<Vec<u16>> {
+    crate::text_input::unicode_chunks(text)
+}
+
+fn aggregate_flags(held: &std::collections::BTreeSet<u16>) -> CGEventFlags {
+    CGEventFlags(held.iter().filter_map(|&k| modifier_flag(k)).fold(0, |flags, f| flags | f.0))
 }
 
 /// A point given as 0..1 of a stream, in global desktop points within `b` (a display,
@@ -393,7 +401,111 @@ fn modifier_flag(keycode: u16) -> Option<CGEventFlags> {
     })
 }
 
+thread_local! { static STEP_RESULT: std::cell::Cell<crate::text_input::Completion> = const { std::cell::Cell::new(crate::text_input::Completion::Completed) }; }
+
 impl crate::media::InputSink for Injector {
+    fn execute_step(&mut self, operation: &crate::input_queue::Operation) -> crate::text_input::Completion {
+        use crate::input_queue::{Control, Operation, Physical};
+        use crate::text_input::{Completion, Packet, transient};
+        if matches!(operation, Operation::Ownership) { return Completion::Completed; }
+        // CGEventPost has no delivery result. Completed means all events were allocated
+        // and posted with permission present, NOT observed by the receiving application.
+        if !has_accessibility() { return Completion::Failed; }
+        match operation {
+            Operation::Scalar(ch) => {
+                let mut units = [0; 2];
+                let unicode = ch.encode_utf16(&mut units);
+                let actions = if *ch == '\n' { transient(0x24, self.held.contains(&0x24)) }
+                    else { vec![Packet::Key(0, true), Packet::Key(0, false)] };
+                // Allocate every event before attempting the scalar; supplementary units
+                // are attached together to each event. No whole-text queue or flags snapshot.
+                let mut events = Vec::new();
+                for action in actions {
+                    let Packet::Key(key, down) = action else { unreachable!() };
+                    let Some(event) = CGEvent::new_keyboard_event(self.source.as_deref(), key, down) else { return Completion::Failed; };
+                    if *ch != '\n' {
+                        // SAFETY: complete scalar buffer lives through the call.
+                        unsafe { CGEvent::keyboard_set_unicode_string(Some(&event), unicode.len() as _, unicode.as_ptr()) };
+                    }
+                    events.push(event);
+                }
+                for event in events { self.post_with_flags(event, CGEventFlags(0)); }
+                // self.flags remains the current aggregate; next physical event sees it.
+                // At most 4ms pacing per scalar; future worker can move this to a deadline.
+                std::thread::sleep(std::time::Duration::from_millis(4));
+                Completion::Completed
+            }
+            Operation::Down(physical) | Operation::Repeat(physical) | Operation::Up(physical) => {
+                let down = !matches!(operation, Operation::Up(_));
+                match *physical {
+                    Physical::Key(key) => {
+                        let Some(event) = CGEvent::new_keyboard_event(self.source.as_deref(), key, down) else {
+                            return if down { Completion::Failed } else { Completion::Unknown };
+                        };
+                        if down { self.held.insert(key); } else { self.held.remove(&key); }
+                        self.flags = aggregate_flags(&self.held);
+                        self.post_with_flags(event, self.flags);
+                    }
+                    Physical::Button(button) => {
+                        if self.pen.is_some() {
+                            if button > 2 { return Completion::Unsupported; }
+                            STEP_RESULT.with(|r| r.set(Completion::Completed));
+                            self.handle(if down { InputEvent::MouseDown { button } } else { InputEvent::MouseUp { button } });
+                            return STEP_RESULT.with(|r| r.get());
+                        }
+                        let Some((ty, cg_button)) = mouse_button(button, down) else { return Completion::Unsupported; };
+                        let Some(event) = CGEvent::new_mouse_event(self.source.as_deref(), ty, self.pos, cg_button) else {
+                            return if down { Completion::Failed } else { Completion::Unknown };
+                        };
+                        if down { self.click_count = self.next_click_count(button); }
+                        CGEvent::set_integer_value_field(Some(&event), CLICK_STATE, self.click_count);
+                        self.post_with_flags(event, self.flags);
+                        self.buttons[button as usize] = down;
+                    }
+                }
+                Completion::Completed
+            }
+            Operation::Ownership => Completion::Completed,
+            Operation::Control(control) => {
+                STEP_RESULT.with(|r| r.set(Completion::Completed));
+                match control {
+                    Control::MoveAbsolute { .. } => return Completion::Unsupported,
+                    Control::Reset => return self.reset_state(),
+                    Control::Configure { displays, window } => {
+                        let result = self.execute_step(&Operation::Control(Control::Displays(displays.clone())));
+                        if result != Completion::Completed { return result; }
+                        return self.execute_step(&Operation::Control(Control::Window(*window)));
+                    }
+                    Control::Display(id) => { self.displays = vec![*id]; self.window = None; }
+                    Control::Displays(ids) => { self.displays = ids.to_vec(); self.window = None; }
+                    Control::Window(rect) => self.window = rect.map(|[x,y,width,height]| CGRect { origin: CGPoint { x,y }, size: objc2_core_foundation::CGSize { width,height } }),
+                    Control::Move { display, x, y } => self.move_to(to_global(CGDisplayBounds(*display), *x, *y)),
+                    Control::Event(ev) => {
+                        if matches!(ev, InputEvent::Gamepad { .. }) { crate::gamepad::handle(*ev); }
+                        else { self.handle(*ev); }
+                    }
+                    Control::Paste => {
+                        let mut events = vec![];
+                        for packet in transient(KVK_V, self.held.contains(&KVK_V)) {
+                            let Packet::Key(key, down) = packet else { unreachable!() };
+                            let Some(ev) = CGEvent::new_keyboard_event(self.source.as_deref(), key, down) else { return Completion::Failed; };
+                            events.push(ev);
+                        }
+                        for ev in events { self.post_with_flags(ev, CGEventFlags::MaskCommand); }
+                    }
+                }
+                STEP_RESULT.with(|r| r.get())
+            },
+        }
+    }
+
+    fn reset_state(&mut self) -> crate::text_input::Completion {
+        use crate::text_input::Completion;
+        if !has_accessibility() { return Completion::Failed; }
+        STEP_RESULT.with(|r| r.set(Completion::Completed));
+        self.release_all();
+        STEP_RESULT.with(|r| r.get())
+    }
     fn handle(&mut self, ev: glass_proto::InputEvent) {
         Injector::handle(self, ev)
     }
@@ -431,6 +543,44 @@ impl crate::media::InputSink for Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_releases_nonmodifiers_and_clears_enter_borrowing() {
+        let held = std::collections::BTreeSet::from([0, 0x24, 0x31, KVK_SHIFT]);
+        let mut input = Injector {
+            source: None, displays: Vec::new(), window: None,
+            pos: CGPoint { x: 0.0, y: 0.0 }, buttons: [false; 3],
+            flags: aggregate_flags(&held), held,
+            test_key_events: Some(Vec::new()), last_click: None,
+            click_count: 1, delta: (0, 0), pen: None, scroll: (0.0, 0.0),
+        };
+        input.release_all();
+        assert_eq!(input.test_key_events.as_ref().unwrap(),
+            &vec![(0, false), (0x24, false), (0x31, false), (KVK_SHIFT, false)]);
+        assert!(input.held.is_empty());
+        assert_eq!(input.flags, CGEventFlags(0));
+        input.release_all();
+        assert_eq!(input.test_key_events.as_ref().unwrap().len(), 4);
+        assert_eq!(crate::text_input::transient(0x24u16, input.held.contains(&0x24)),
+            vec![crate::text_input::Packet::Key(0x24, true), crate::text_input::Packet::Key(0x24, false)]);
+    }
+
+    #[test]
+    fn releasing_one_side_keeps_other_held_modifier_flags() {
+        let mut held = std::collections::BTreeSet::from([KVK_SHIFT, KVK_RIGHT_SHIFT, KVK_COMMAND]);
+        held.remove(&KVK_SHIFT);
+        assert_eq!(aggregate_flags(&held), CGEventFlags(CGEventFlags::MaskShift.0 | CGEventFlags::MaskCommand.0));
+        held.remove(&KVK_RIGHT_SHIFT);
+        assert_eq!(aggregate_flags(&held), CGEventFlags::MaskCommand);
+    }
+
+    #[test]
+    fn unicode_chunks_never_split_a_surrogate_pair() {
+        let chunks = unicode_chunks("123456789012345😀x");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(String::from_utf16(&chunks[0]).unwrap(), "123456789012345");
+        assert_eq!(String::from_utf16(&chunks[1]).unwrap(), "😀x");
+    }
 
     #[test]
     fn window_coordinates_land_inside_the_window() {

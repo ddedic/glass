@@ -663,9 +663,46 @@ static INPUT: Mutex<Recorded> = Mutex::new(Recorded {
     pastes: 0,
 });
 
+#[derive(Default)]
+struct InputGate { blocked: bool, entered: u64, completion: Option<crate::text_input::Completion> }
+static INPUT_GATE: (Mutex<InputGate>, std::sync::Condvar) = (Mutex::new(InputGate { blocked: false, entered: 0, completion: None }), std::sync::Condvar::new());
+#[derive(serde::Deserialize)]
+struct GateRequest { blocked: bool, completion: Option<String> }
+
 pub struct FakeInput;
 
 impl InputSink for FakeInput {
+    fn execute_step(&mut self, op: &crate::input_queue::Operation) -> crate::text_input::Completion {
+        use crate::input_queue::{Operation, Physical, Control};
+        if matches!(op, Operation::Scalar(_)) {
+            let (lock, wake) = &INPUT_GATE;
+            let mut gate = lock.lock().unwrap();
+            gate.entered += 1;
+            while gate.blocked { gate = wake.wait(gate).unwrap(); }
+            if let Some(completion) = gate.completion.take() { return completion; }
+        }
+        match op {
+            Operation::Ownership => {},
+            Operation::Scalar(ch) => {
+                INPUT.lock().unwrap().events.push(serde_json::json!({"t":"text", "text":ch.to_string()}));
+            }
+            Operation::Down(p) | Operation::Repeat(p) | Operation::Up(p) => {
+                let down = !matches!(op, Operation::Up(_));
+                self.handle(match (*p, down) {
+                    (Physical::Key(keycode), true) => InputEvent::KeyDown { keycode },
+                    (Physical::Key(keycode), false) => InputEvent::KeyUp { keycode },
+                    (Physical::Button(button), true) => InputEvent::MouseDown { button },
+                    (Physical::Button(button), false) => InputEvent::MouseUp { button },
+                });
+            }
+            Operation::Control(Control::Event(ev)) => self.handle(*ev),
+            Operation::Control(Control::Paste) => self.paste(),
+            Operation::Control(Control::Move { display, x, y }) => self.move_on_display(*display, *x, *y),
+            Operation::Control(_) => {},
+        }
+        crate::text_input::Completion::Completed
+    }
+
     fn handle(&mut self, ev: InputEvent) {
         let json = match ev {
             InputEvent::MouseMove { x, y, stream } => {
@@ -816,14 +853,28 @@ struct DropQuery {
     frames: u32,
 }
 
-pub fn routes(events: broadcast::Sender<ServerMsg>, downloads: PathBuf) -> axum::Router {
+pub fn routes(events: broadcast::Sender<ServerMsg>, downloads: PathBuf, input: crate::input_dispatch::Dispatch) -> axum::Router {
     axum::Router::new()
+        .route("/test/input-gate", get(|| async {
+            let gate = INPUT_GATE.0.lock().unwrap();
+            Json(serde_json::json!({"entered":gate.entered,"blocked":gate.blocked}))
+        }).post(|Json(request): Json<GateRequest>| async move {
+            use crate::text_input::Completion;
+            let mut gate = INPUT_GATE.0.lock().unwrap();
+            gate.blocked = request.blocked;
+            gate.completion = request.completion.as_deref().map(|value| match value {
+                "partial" => Completion::Partial, "failed" => Completion::Failed,
+                "unknown" => Completion::Unknown, "unsupported" => Completion::Unsupported,
+                _ => Completion::Completed,
+            });
+            INPUT_GATE.1.notify_all();
+        }))
         .route(
             "/test/input",
-            get(|| async {
+            get(move || { let input = input.clone(); async move {
                 let r = INPUT.lock().unwrap();
-                Json(serde_json::json!({"events": r.events, "pastes": r.pastes}))
-            })
+                Json(serde_json::json!({"events": r.events, "pastes": r.pastes, "pending": input.pending_count(), "owners":input.owner_count()}))
+            } })
             .delete(|| async {
                 *INPUT.lock().unwrap() = Recorded::default();
             }),

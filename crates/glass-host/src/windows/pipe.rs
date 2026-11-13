@@ -11,7 +11,7 @@ use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Threading::CreateEventW;
 
-pub struct Pipe(HANDLE);
+pub struct Pipe { handle: HANDLE, cancelled: std::sync::atomic::AtomicBool }
 
 // SAFETY: a kernel handle; overlapped operations on it may run from any thread at once.
 unsafe impl Send for Pipe {}
@@ -20,11 +20,11 @@ unsafe impl Sync for Pipe {}
 impl Pipe {
     /// Takes ownership of a handle opened with FILE_FLAG_OVERLAPPED.
     pub fn from_handle(handle: HANDLE) -> Self {
-        Self(handle)
+        Self { handle, cancelled: std::sync::atomic::AtomicBool::new(false) }
     }
 
     pub fn handle(&self) -> HANDLE {
-        self.0
+        self.handle
     }
 
     /// Opens the client end of `name` for overlapped I/O.
@@ -44,19 +44,50 @@ impl Pipe {
             )
         }
         .map_err(io::Error::from)?;
-        Ok(Self(handle))
+        Ok(Self { handle, cancelled: std::sync::atomic::AtomicBool::new(false) })
     }
 
     /// Server end: waits for a client to connect. True when one is there.
     pub fn connect(&self) -> bool {
         use windows::Win32::System::Pipes::ConnectNamedPipe;
         // SAFETY: a server pipe handle and a live OVERLAPPED.
-        self.overlapped(|ov| unsafe { ConnectNamedPipe(self.0, Some(ov)) }).is_ok()
+        self.overlapped(|ov| unsafe { ConnectNamedPipe(self.handle, Some(ov)) }).is_ok()
     }
 
     /// Runs one overlapped operation and waits for it to finish; how many bytes it moved
     /// (0 at the end of the pipe).
     fn overlapped(&self, start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>) -> io::Result<usize> {
+        self.overlapped_until(None, start)
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::Release);
+        // SAFETY: cancellation does not free buffers; their owning calls still join I/O.
+        let _ = unsafe { windows::Win32::System::IO::CancelIoEx(self.handle, None) };
+    }
+
+    pub fn read_until(&self, buf: &mut [u8], deadline: std::time::Instant) -> io::Result<()> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let n = self.overlapped_until(Some(deadline), |ov| unsafe { ReadFile(self.handle, Some(&mut buf[offset..]), None, Some(ov)) })?;
+            if n == 0 { return Err(io::ErrorKind::UnexpectedEof.into()); }
+            offset += n;
+        }
+        Ok(())
+    }
+
+    pub fn write_until(&self, buf: &[u8], deadline: std::time::Instant) -> io::Result<()> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let n = self.overlapped_until(Some(deadline), |ov| unsafe { WriteFile(self.handle, Some(&buf[offset..]), None, Some(ov)) })?;
+            if n == 0 { return Err(io::ErrorKind::WriteZero.into()); }
+            offset += n;
+        }
+        Ok(())
+    }
+
+    fn overlapped_until(&self, deadline: Option<std::time::Instant>, start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>) -> io::Result<usize> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) { return Err(io::ErrorKind::ConnectionAborted.into()); }
         // SAFETY: the event and OVERLAPPED live until the operation has finished (we wait
         // for it before returning); the event is closed after.
         unsafe {
@@ -68,7 +99,19 @@ impl Pipe {
                 // Done already, or under way: either way the count comes from here.
                 _ => {
                     let mut n = 0u32;
-                    GetOverlappedResult(self.0, &ov, &mut n, true).map(|_| n as usize).map_err(io::Error::from)
+                    if self.cancelled.load(std::sync::atomic::Ordering::Acquire) { let _ = windows::Win32::System::IO::CancelIoEx(self.handle, Some(&ov)); }
+                    if let Some(deadline) = deadline {
+                        use windows::Win32::{Foundation::WAIT_OBJECT_0, System::{IO::CancelIoEx, Threading::WaitForSingleObject}};
+                        let ms = deadline.saturating_duration_since(std::time::Instant::now()).as_millis().min(u32::MAX as u128 - 1) as u32;
+                        if WaitForSingleObject(event, ms) != WAIT_OBJECT_0 {
+                            let _ = CancelIoEx(self.handle, Some(&ov));
+                            // Join cancellation before the caller's buffer/OVERLAPPED dies.
+                            let _ = GetOverlappedResult(self.handle, &ov, &mut n, true);
+                            let _ = CloseHandle(event);
+                            return Err(io::ErrorKind::TimedOut.into());
+                        }
+                    }
+                    GetOverlappedResult(self.handle, &ov, &mut n, true).map(|_| n as usize).map_err(io::Error::from)
                 }
             };
             let _ = CloseHandle(event);
@@ -83,14 +126,14 @@ impl Pipe {
 impl io::Read for &Pipe {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // SAFETY: buf outlives the wait in `overlapped`.
-        self.overlapped(|ov| unsafe { ReadFile(self.0, Some(buf), None, Some(ov)) })
+        self.overlapped(|ov| unsafe { ReadFile(self.handle, Some(buf), None, Some(ov)) })
     }
 }
 
 impl io::Write for &Pipe {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // SAFETY: buf outlives the wait in `overlapped`.
-        self.overlapped(|ov| unsafe { WriteFile(self.0, Some(buf), None, Some(ov)) })
+        self.overlapped(|ov| unsafe { WriteFile(self.handle, Some(buf), None, Some(ov)) })
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -101,6 +144,6 @@ impl io::Write for &Pipe {
 impl Drop for Pipe {
     fn drop(&mut self) {
         // SAFETY: owned handle, closed once.
-        let _ = unsafe { CloseHandle(self.0) };
+        let _ = unsafe { CloseHandle(self.handle) };
     }
 }

@@ -314,6 +314,33 @@ test.describe('displays', () => {
 });
 
 test.describe('input', () => {
+  it('one viewer cannot release another viewers held Shift; disconnect releases the final owner', async ({ page, host, browser }) => {
+    await open(page, host);
+    // Separate browser storage/locks: two tabs of one viewer deliberately exclude each other.
+    const other = await browser.newPage();
+    await open(other, host);
+    await host.clearInput();
+    const key = (target, type, code) => target.evaluate(({ type, code }) => {
+      document.querySelector('#keys').dispatchEvent(new KeyboardEvent(type, {
+        code, key: code === 'ShiftLeft' ? 'Shift' : code, bubbles: true, cancelable: true,
+      }));
+    }, { type, code });
+    await key(page, 'keydown', 'ShiftLeft');
+    await expect.poll(() => keys(host, 'keydown')).toEqual([K.Shift]);
+    await key(other, 'keydown', 'ShiftLeft');
+    await key(other, 'keydown', 'Tab');
+    await key(other, 'keyup', 'Tab');
+    await expect.poll(() => keys(host, 'keyup')).toEqual([K.Tab]);
+    await key(page, 'keyup', 'ShiftLeft');
+    // This same-stream barrier proves the earlier Shift release was processed.
+    await key(page, 'keydown', 'ArrowRight');
+    await key(page, 'keyup', 'ArrowRight');
+    await expect.poll(() => keys(host, 'keyup')).toEqual([K.Tab, 0x7c]);
+    await other.close();
+    await expect.poll(() => keys(host, 'keyup')).toEqual([K.Tab, 0x7c, K.Shift]);
+    expect(await keys(host, 'keydown')).toEqual([K.Shift, K.Tab, 0x7c]);
+  });
+
   it('maps mouse position and clicks onto the right display', async ({ page, host }) => {
     await open(page, host);
     await pickMenuItem(page, 'btn-displays', 'All displays');
@@ -352,8 +379,9 @@ test.describe('input', () => {
     expect((await host.input('scroll')).events.reduce((sum, e) => sum + e.dy, 0)).toBeCloseTo(120 * 640 / shown, 0);
   });
 
-  it('sends typed keys as Mac keycodes', async ({ page, host }) => {
+  it('a host without hybrid support receives physical Mac keycodes by default', async ({ page, host }) => {
     await open(page, host);
+    await expect(page.getByRole('menuitemradio', { name: /Physical keyboard/ })).toHaveCount(0);
     await host.clearInput();
     // Like a real keyboard: Shift is its own key press.
     await page.keyboard.press('Shift+KeyH');
@@ -373,12 +401,13 @@ test.describe('input', () => {
       sink.dispatchEvent(new CompositionEvent('compositionstart', { data: '' }));
       sink.dispatchEvent(new CompositionEvent('compositionend', { data: '日本語' }));
     });
-    // Plain ASCII still goes as keys.
+    // ASCII uses the same text path; editing keys remain physical.
     await page.keyboard.insertText('i');
-    await expect.poll(() => keys(host, 'keyup')).toEqual([K.I]);
+    await page.keyboard.press('Tab');
+    await expect.poll(() => keys(host, 'keyup')).toEqual([K.Tab]);
     const { events } = await host.input();
     const typed = events.filter((e) => e.t === 'text' || e.t === 'keydown').map((e) => e.text ?? e.keycode);
-    expect(typed).toEqual(['café 👍', '日本語', K.I]);
+    expect(typed).toEqual([...('café 👍日本語i'), K.Tab]);
   });
 
   it('PC keyboard mode turns Ctrl into ⌘ and Super into Ctrl', async ({ page, host }) => {
@@ -526,15 +555,15 @@ test.describe('input', () => {
     expect(await page.locator('#screens').evaluate((el) => el.style.transform)).toBe('');
   });
 
-  it('on-screen keyboard text becomes key taps', async ({ page, host }) => {
+  it('on-screen keyboard text stays text and deletion becomes a key tap', async ({ page, host }) => {
     await open(page, host);
     await host.clearInput();
     await page.locator('#keys').evaluate((el) => {
       el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: 'a!', bubbles: true, cancelable: true }));
       el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'deleteContentBackward', bubbles: true, cancelable: true }));
     });
-    // a, then ! = Shift+1, then Backspace.
-    await expect.poll(() => keys(host, 'keydown')).toEqual([K.A, K.Shift, 0x12, 0x33]);
+    await expect.poll(() => keys(host, 'keydown')).toEqual([0x33]);
+    expect((await host.input('text')).events.map((e) => e.text).join('')).toBe('a!');
   });
 });
 
@@ -554,7 +583,13 @@ test.describe('clipboard and files', () => {
     expect((await host.input()).pastes).toBe(1);
   });
 
-  it('focuses the hidden key field while ⌘ is down, so Safari fires paste', async ({ page, host }) => {
+  it('temporarily focuses the hidden key field for paste on iPad', async ({ page, host }) => {
+    await page.addInitScript(() => {
+      // iPadOS uses a desktop Mac UA; unlike desktop browsers, screen clicks must not
+      // focus the sink because that would exit fullscreen and summon the keyboard.
+      Object.defineProperty(navigator, 'userAgent', { value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15 Safari/605.1.15' });
+      Object.defineProperty(navigator, 'maxTouchPoints', { value: 5 });
+    });
     await open(page, host);
     await page.locator('#screens').click();
     expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('keys');
@@ -838,8 +873,8 @@ test.describe('machines', () => {
       await host.clearInput();
       await other.clearInput();
       await page.keyboard.press('a');
-      await expect.poll(async () => (await other.input('keydown')).events.length).toBe(1);
-      expect((await host.input('keydown')).events).toHaveLength(0);
+      await expect.poll(async () => (await other.input('text')).events.map((e) => e.text)).toEqual(['a']);
+      expect((await host.input('text')).events).toHaveLength(0);
 
       // A machine that never answers: back home after a few tries or a timeout.
       await page.evaluate(() => localStorage.setItem('glass.machine', 'localhost:1'));
@@ -895,5 +930,59 @@ test.describe('updates', () => {
     } finally {
       await host.stop();
     }
+  });
+});
+
+test.describe('input scheduling', () => {
+  async function rawInput(page, host) {
+    await page.goto(`${host.base}/config.json`);
+    await page.evaluate(async ({ wt, token }) => {
+      const config = await fetch('/config.json').then(r => r.json());
+      const transport = new WebTransport(`https://localhost:${wt}/`, {
+        serverCertificateHashes: [{ algorithm: 'sha-256', value: new Uint8Array(config.certHash) }],
+      });
+      await transport.ready;
+      const ctl = await transport.createBidirectionalStream();
+      const body = new TextEncoder().encode(JSON.stringify({ t: 'hello', token }));
+      const frame = new Uint8Array(body.length + 4);
+      new DataView(frame.buffer).setUint32(0, body.length, true); frame.set(body, 4);
+      await ctl.writable.getWriter().write(frame);
+      const reader = ctl.readable.getReader();
+      await reader.read();
+      const writer = (await transport.createUnidirectionalStream()).getWriter();
+      await writer.write(new Uint8Array([0x49]));
+      const proto = await import('/proto.js');
+      window.raw = { transport, writer, reader, proto };
+    }, { wt: host.wt, token: host.token });
+  }
+  async function gate(host, blocked) {
+    const response = await fetch(`${host.base}/test/input-gate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ blocked }) });
+    expect(response.ok).toBeTruthy();
+  }
+  it('admits same-stream up while scalar is blocked and executes up before the suffix', async ({ page, host }) => {
+    await rawInput(page, host);
+    await page.evaluate(() => raw.writer.write(raw.proto.inputEvent(5, { keycode: 49 })));
+    await expect.poll(() => keys(host, 'keydown')).toEqual([49]);
+    await gate(host, true);
+    await page.evaluate(async () => { for (const ev of raw.proto.textEvents('abc')) await raw.writer.write(ev); });
+    await expect.poll(async () => (await fetch(`${host.base}/test/input-gate`).then(r => r.json())).entered).toBe(1);
+    await page.evaluate(() => raw.writer.write(raw.proto.inputEvent(6, { keycode: 49 })));
+    await expect.poll(async () => (await host.get('/test/input')).pending).toBe(2);
+    await gate(host, false);
+    await expect.poll(async () => (await host.input()).events.map(e => e.t === 'text' ? e.text : e.t)).toEqual(['keydown', 'a', 'keyup', 'b', 'c']);
+    await page.evaluate(() => raw.transport.close());
+  });
+  it('EOF cancels the blocked scalar suffix without draining text', async ({ page, host }) => {
+    await rawInput(page, host);
+    await gate(host, true);
+    await page.evaluate(async () => { for (const ev of raw.proto.textEvents('abcdef')) await raw.writer.write(ev); });
+    await expect.poll(async () => (await fetch(`${host.base}/test/input-gate`).then(r => r.json())).entered).toBe(1);
+    await page.evaluate(() => raw.writer.close());
+    // An ordinary queued command is cancelled by EOF even while native input is blocked.
+    await page.evaluate(() => raw.transport.close());
+    await expect.poll(async () => (await host.get('/test/input')).owners).toBe(0);
+    await gate(host, false);
+    await expect.poll(async () => (await host.get('/test/input')).pending).toBe(0);
+    expect((await host.input('text')).events.map(e => e.text).join('')).toBe('a');
   });
 });

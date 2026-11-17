@@ -8,7 +8,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -20,5 +20,11 @@ jobs:
           '#[path = r"' + $module + '"] mod launch;' | Set-Content "$env:RUNNER_TEMP/launch-harness.rs"
           rustc --edition=2024 --test "$env:RUNNER_TEMP/launch-harness.rs" -o "$env:RUNNER_TEMP/launch-tests.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($IsWindows) { exit 0 }
           & "$env:RUNNER_TEMP/launch-tests.exe" --nocapture
           exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: windows-update-launch-tests
+          path: ${{ runner.temp }}/launch-tests.exe

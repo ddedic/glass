@@ -34,7 +34,10 @@ mod tests {
             let path = std::env::temp_dir().join(format!(
                 "glass-update-launch-{}-{}",
                 std::process::id(),
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
             ));
             std::fs::create_dir(&path).unwrap();
             Self(path)
@@ -63,6 +66,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "requires a Windows session that permits job breakaway"
+    )]
     fn installer_executes_and_logs_output() {
         let scratch = Scratch::new();
         let log = scratch.0.join("update.log");
@@ -91,6 +98,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "requires a Windows session that permits job breakaway"]
     fn installer_survives_launcher_exit() {
         let scratch = Scratch::new();
         let fixture = concat!(module_path!(), "::installer_parent_fixture");

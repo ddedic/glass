@@ -114,17 +114,23 @@ mod tests {
         assert!(wait(&mut parent).success());
         let marker = scratch.0.join("survived");
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !marker.exists() && Instant::now() < deadline {
+        while std::fs::read_to_string(&marker).ok().as_deref() != Some("survived") {
+            assert!(
+                Instant::now() < deadline,
+                "installer did not finish after its launcher exited"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(std::fs::read_to_string(marker).unwrap(), "survived");
     }
 
     #[cfg(windows)]
     #[test]
     #[ignore = "subprocess fixture for installer_survives_launcher_exit"]
     fn installer_parent_fixture() {
-        let dir = std::path::PathBuf::from(std::env::var_os("GLASS_UPDATE_TEST_DIR").unwrap());
+        let Some(dir) = std::env::var_os("GLASS_UPDATE_TEST_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
         let mut cmd = Command::new("powershell.exe");
         cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
             .arg("while (Get-Process -Id $env:GLASS_UPDATE_TEST_PARENT -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 20 }; [IO.File]::WriteAllText($env:GLASS_UPDATE_TEST_MARKER, 'survived')")

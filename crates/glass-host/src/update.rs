@@ -2,6 +2,8 @@
 //! now and then; a client can ask the host to update itself, which re-runs the installer
 //! in its own process group so it survives the service restart it triggers.
 
+mod launch;
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -124,21 +126,7 @@ pub fn start_self_update() -> anyhow::Result<()> {
     let installing = Installing::begin()?;
     let log = crate::platform::log_dir().join("update.log");
     let _ = std::fs::create_dir_all(log.parent().unwrap());
-    let mut cmd = installer();
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::fs::File::create(&log)?)
-        .stderr(std::fs::File::options().append(true).open(&log)?);
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
-    }
-    let mut child = cmd.spawn()?;
+    let mut child = launch::spawn(installer(), &log)?;
     tracing::info!("self-update started; log: {}", log.display());
     // Done without restarting us (it failed, or there was nothing to do): it may be asked again.
     std::thread::spawn(move || {

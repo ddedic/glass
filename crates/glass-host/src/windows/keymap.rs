@@ -23,6 +23,12 @@ pub const V: Key = Scan(0x2F, false);
 pub const LEFT_WIN: Key = Scan(0x5B, true);
 pub const RIGHT_WIN: Key = Scan(0x5C, true);
 
+/// Ctrl/Alt/Win can turn resolved text into shortcuts. Unicode ignores Shift, so keep
+/// Shift held: releasing and pressing it per character can toggle IMEs or Sticky Keys.
+pub fn is_text_modifier(key: Key) -> bool {
+    matches!(key, Scan(0x1D | 0x38, _) | Scan(0x5B | 0x5C, true))
+}
+
 /// The key for a kVK code.
 pub fn to_key(kvk: u16) -> Option<Key> {
     Some(match kvk {
@@ -146,6 +152,18 @@ pub fn to_key(kvk: u16) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_text_lifts_shortcut_modifiers_but_never_taps_shift() {
+        // Both sides of Ctrl, Alt and Win can turn text into a shortcut.
+        for code in [0x3b, 0x3e, 0x3a, 0x3d, 0x37, 0x36] {
+            assert!(is_text_modifier(to_key(code).unwrap()), "{code:#x}");
+        }
+        // Keep both Shifts held for IMEs/Sticky Keys, as well as ordinary action keys.
+        for code in [0x38, 0x3c, 0x00, 0x31, 0x24, 0x39] {
+            assert!(!is_text_modifier(to_key(code).unwrap()), "{code:#x}");
+        }
+    }
 
     #[test]
     fn letters_and_modifiers() {

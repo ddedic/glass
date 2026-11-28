@@ -378,6 +378,8 @@ impl Perms {
 /// What this host can do, so the viewer shows only what works.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Features {
+    /// Resolved viewer characters use layout-independent Unicode, including in the helper.
+    pub viewer_typing_v1: bool,
     pub privacy: bool,
     pub gamepad: bool,
     pub mic: bool,

@@ -25,7 +25,7 @@ globalThis.requestAnimationFrame = () => 1;
 globalThis.fetch = async () => ({});
 const { attachInput } = await import('../../web/input.js');
 
-function setup() {
+function setup(options = {}) {
   const canvas = {
     dataset: { stream: '0' },
     setPointerCapture() {},
@@ -41,6 +41,7 @@ function setup() {
   const input = attachInput({
     screens, keySink, control() {}, nextClipboard: async () => ({}), onPaste: (c) => sent.push(['paste', c.text]),
     onLocalShortcut() {}, onZoom() {}, send: (kind, f) => sent.push([kind, f.button ?? f.keycode]),
+    ...options,
   });
   input.setVideoSize(0, 100, 100);
   const pointer = (target, type, fields = {}) => target.dispatchEvent(Object.assign(new Event(type, { cancelable: true }), { clientX: 10, clientY: 10, pointerId: 1, button: 0, pointerType: 'mouse', ...fields }));
@@ -185,4 +186,21 @@ test('⌘V: a paste event after the keystroke went doesn\'t paste a second time'
   paste('next');
   assert.deepEqual(sent.filter(([k]) => k === 'paste'), [['paste', 'next']]);
   await pause(170);
+});
+
+
+test('viewer typing is gated to a capable Windows host and a Mac viewer', () => {
+  for (const [os, macViewer, capability, text] of [
+    ['windows', true, true, true], ['macos', true, true, false],
+    ['linux', true, true, false], ['windows', false, true, false], ['windows', true, false, false],
+  ]) {
+    const events = [];
+    const { input, key } = setup({ macViewer, send: (kind, fields) => events.push(kind === Input.TEXT
+      ? new TextDecoder().decode(fields.bytes.slice(2, 2 + (fields.bytes[1] & 127))) : [kind, fields.keycode]) });
+    input.setHostOs(os);
+    input.setViewerTyping(capability);
+    key('keydown', 'KeyY', { key: 'z' });
+    key('keyup', 'KeyY', { key: 'z' });
+    assert.deepEqual(events, text ? ['z'] : [[Input.KEY_DOWN, 16], [Input.KEY_UP, 16]]);
+  }
 });

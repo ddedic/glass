@@ -41,7 +41,7 @@ const MODIFIER_KEYCODES = new Set(MODIFIER_CODES.map((c) => MAC_KEYCODES[c]));
  */
 export function attachInput({
   screens, keySink, send: sendNow, control, nextClipboard, onMacCopy = () => {}, onPaste, onLocalShortcut, swapCmdOption = false,
-  ctrlAsCmd = true, pcKeyboard = false, onZoom, onResize = () => {},
+  ctrlAsCmd = true, pcKeyboard = false, macViewer = /Macintosh|Mac OS X/.test(navigator.userAgent), onZoom, onResize = () => {},
 }) {
   // With iPadOS set to turn the physical ⌘ key into ⌥ (so it can't claim ⌘Tab etc.),
   // swap them back here so the Mac gets the keys the user actually pressed.
@@ -68,6 +68,9 @@ export function attachInput({
 
   // Remaps exist to make a non-Mac keyboard behave on a Mac; other hosts get keys as typed.
   let macHost = true;
+  let windowsHost = false;
+  let viewerTyping = false;
+  const characterMode = () => macViewer && windowsHost && viewerTyping;
   const codeOf = (e) => (!macHost ? undefined : pc ? PC[e.code] : swap ? SWAPPED[e.code] : undefined) ?? e.code;
   const cmdHeld = (e) => (!macHost ? e.metaKey : pc ? e.ctrlKey : swap ? e.altKey : e.metaKey);
   // Copy and paste: ⌘ on a Mac host; Ctrl on Windows and Linux (and ⌘V still pastes this
@@ -601,6 +604,8 @@ export function attachInput({
   // ---- Keyboard ----
 
   const heldKeys = new Set();
+  // Remember a text press until its real up: changing modifiers must not change its route.
+  const textKeys = new Set();
   let pasteHandled = true;
   let pasteTimer;
   let pasteSentAt = -Infinity; // when ⌘V last went as a keystroke, no paste event having come
@@ -622,6 +627,7 @@ export function attachInput({
   }
   function releaseAllKeys() {
     releaseKeys();
+    textKeys.clear();
     cmdForCtrl = false;
   }
 
@@ -633,13 +639,13 @@ export function attachInput({
   }
 
   /**
-   * Typed text: as key presses when each character has a key on a US keyboard (as before),
-   * else as text the host types as is: IME results, emoji, accented letters.
+   * Capable Windows hosts receive resolved text as is. Other sessions retain the existing
+   * US-key fallback for mapped characters, and Text for IME results and accented letters.
    */
   function typeText(text) {
     if (!text) return;
     const keys = [...text].map(charToKey);
-    if (keys.every(Boolean)) {
+    if (!characterMode() && keys.every(Boolean)) {
       for (const key of keys) tapKey(key.keycode, key.shift);
       return;
     }
@@ -664,6 +670,12 @@ export function attachInput({
     if (e.isComposing || e.keyCode === 229) return;
     const code = codeOf(e);
     const keycode = MAC_KEYCODES[code];
+    if (characterMode() && e.key === 'Dead' && !e.ctrlKey && !e.metaKey && !e.altKey
+        && !heldKeys.has(keycode) && !textKeys.has(code)) {
+      // Plain dead keys compose locally; Option/Alt chords keep their physical route.
+      keySink.focus({ preventScroll: true });
+      return;
+    }
     // On-screen keyboards often report no code; their text arrives via beforeinput.
     if (keycode === undefined) return;
 
@@ -711,6 +723,14 @@ export function attachInput({
       heldKeys.add(CMD);
       send(Input.KEY_DOWN, { keycode: CMD });
     }
+    const printable = [...(e.key ?? '')].length === 1 && !/[\u0000-\u001f\u007f]/u.test(e.key);
+    if (textKeys.has(code) || (characterMode() && !heldKeys.has(keycode)
+        && printable && !(code === 'Space' && e.key === ' ')
+        && !e.ctrlKey && !e.metaKey && !e.altKey)) {
+      textKeys.add(code);
+      if (printable) typeText(e.key);
+      return;
+    }
     heldKeys.add(keycode);
     send(Input.KEY_DOWN, { keycode });
   });
@@ -728,10 +748,14 @@ export function attachInput({
       if (heldKeys.delete(CMD)) send(Input.KEY_UP, { keycode: CMD });
       return;
     }
+    if (textKeys.delete(code)) return;
     if (!heldKeys.delete(keycode)) return;
     send(Input.KEY_UP, { keycode });
     // macOS browsers swallow keyup for keys pressed while Cmd was held.
-    if (code === 'MetaLeft' || code === 'MetaRight') releaseKeys((k) => !MODIFIER_KEYCODES.has(k));
+    if (code === 'MetaLeft' || code === 'MetaRight') {
+      releaseKeys((k) => !MODIFIER_KEYCODES.has(k));
+      textKeys.clear();
+    }
   });
 
   window.addEventListener('blur', () => {
@@ -839,6 +863,12 @@ export function attachInput({
     setHostOs(os) {
       releaseAllKeys();
       macHost = os === 'macos';
+      windowsHost = os === 'windows';
+      viewerTyping = false;
+    },
+    setViewerTyping(on) {
+      releaseAllKeys();
+      viewerTyping = Boolean(on);
     },
     setPcKeyboard(on) {
       releaseAllKeys();

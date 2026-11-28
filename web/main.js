@@ -932,6 +932,7 @@ function onControl(msg) {
       if (!msg.streams.length && displays.length) control({ t: 'selectDisplay', id: displays[0].id });
       ui.setAudioAvailable(msg.audio);
       input.setHostOs(msg.host_os ?? 'macos');
+      input.setViewerTyping(msg.features?.viewer_typing_v1);
       ui.setHostOs(msg.host_os ?? 'macos');
       applyKeyboard(msg.host_os ?? 'macos');
       files.setHostOs(msg.host_os ?? 'macos');

@@ -36,6 +36,17 @@ jobs:
           # The Windows job creates a real firewall rule and reads its addresses back.
           GLASS_FIREWALL_INTEGRATION: ${{ runner.os == 'Windows' && '1' || '0' }}
       - run: cargo build --profile ci -p glass-host
+      # Keep the exact CI build available for live lock-screen/UAC acceptance checks.
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-build
+          path: |
+            target/ci/glass-host.exe
+            target/ci/glassw.exe
+            web/
+          if-no-files-found: error
+          retention-days: 7
       # The GPU encoders' GStreamer library (libglass_gst.so, loaded at run time) builds;
       # the GPU tests are ignored: runners have no VA or NVENC device.
       - if: runner.os == 'Linux'

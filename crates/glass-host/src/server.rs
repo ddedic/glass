@@ -1375,6 +1375,7 @@ async fn control(
             .unwrap_or_default()
     };
     let features = control::Features {
+        viewer_typing_v1: cfg!(windows),
         privacy: crate::privacy::supported(),
         gamepad: crate::gamepad::supported(),
         mic: crate::mic::supported(),

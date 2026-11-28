@@ -24,7 +24,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-    GetKeyboardLayout, HKL, MAPVK_VK_TO_VSC, MOUSEINPUT, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VkKeyScanExW,
+    MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, PEN_FLAG_NONE, PEN_MASK_PRESSURE, PEN_MASK_ROTATION, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN,
@@ -89,58 +89,13 @@ const MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(8);
 /// After each character typed as a Unicode key event, for the app to read it.
 const UNICODE_GAP: std::time::Duration = std::time::Duration::from_millis(40);
 
-/// The keyboard layout of the app in front (what its keys type).
-fn foreground_layout() -> HKL {
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
-    // SAFETY: plain queries.
-    unsafe { GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), None)) }
-}
-
-/// The key that types `unit` on `layout`, and whether it needs Shift. Characters that need
-/// Ctrl or AltGr, or aren't on the layout, have none.
-fn layout_key(unit: u16, layout: HKL) -> Option<(u16, bool)> {
-    // SAFETY: a plain lookup.
-    let scan = unsafe { VkKeyScanExW(unit, layout) };
-    if scan == -1 {
-        return None;
-    }
-    let (vk, mods) = ((scan & 0xFF) as u16, (scan >> 8) & 0xFF);
-    if mods & !1 != 0 {
-        return None;
-    }
-    let shift = mods & 1 != 0;
-    // It has to type exactly this: a layout without "Ü" offers plain U for it.
-    let mut state = [0u8; 256];
-    if shift {
-        state[0x10] = 0x80; // VK_SHIFT
-    }
-    let mut out = [0u16; 4];
-    // SAFETY: buffers sized as given; flag 4 leaves the keyboard's dead-key state alone.
-    let n = unsafe {
-        let code = MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, Some(layout));
-        ToUnicodeEx(vk as u32, code, &state, &mut out, 4, Some(layout))
-    };
-    (n == 1 && out[0] == unit).then_some((vk, shift))
-}
-
-/// Presses and lets go of the key `vk` (with Shift if asked), held long enough to type.
-fn type_key(vk: u16, shift: bool, layout: HKL) {
-    // SAFETY: a plain lookup.
-    let scan = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, Some(layout)) } as u16;
-    let shift_key = Key::Scan(0x2A, false);
-    if shift {
-        send(&[keyboard(shift_key, true)]);
-        settle();
-    }
-    send(&[keyboard_input(vk, scan, KEYBD_EVENT_FLAGS(0))]);
-    std::thread::sleep(MIN_HOLD);
-    send(&[keyboard_input(vk, scan, KEYEVENTF_KEYUP)]);
-    if shift {
-        // Held past the key, as for viewers' keys: let go at once, "#" came out "3".
-        std::thread::sleep(MODIFIER_TAIL);
-        send(&[keyboard(shift_key, false)]);
-    }
-    settle();
+/// One complete Unicode scalar, including both surrogate units, followed by its releases.
+fn unicode_inputs(ch: char) -> Vec<INPUT> {
+    let mut buf = [0u16; 2];
+    let units = ch.encode_utf16(&mut buf);
+    units.iter().map(|&u| keyboard_input(0, u, KEYEVENTF_UNICODE))
+        .chain(units.iter().map(|&u| keyboard_input(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)))
+        .collect()
 }
 
 fn tap(key: Key) {
@@ -664,38 +619,43 @@ impl crate::media::InputSink for Injector {
             self.move_in(r, x, y);
         }
     }
-    /// Any text: each character the keyboard layout has, typed as its key (with Shift if
-    /// it needs it), and others as Unicode key events. Apps read a Unicode key's character
-    /// when they get round to it, and a burst of them sent at once came out as the last
-    /// character over and over (Notepad, in the VM); real keys always type what they are.
+    /// Resolved text uses Unicode packets, never a key inferred from the host/helper layout.
+    /// Keep the existing pacing: Notepad has repeated the last character on bursts.
     fn type_text(&mut self, text: &str) -> bool {
-        // On the secure desktop (e.g. typing a password at the lock screen) injection goes
-        // through the helper, which has no Unicode path; let the caller press keys instead.
         if self.follow_route() {
-            return false;
-        }
-        let layout = foreground_layout();
-        let units: Vec<u16> = text.encode_utf16().collect();
-        let mut i = 0;
-        while i < units.len() {
-            let unit = units[i];
-            if unit == '\n' as u16 {
-                // Newlines as Enter: apps read Return from the key, not the character.
-                tap(Key::Scan(0x1C, false));
-            } else if let Some((vk, shift)) = layout_key(unit, layout) {
-                type_key(vk, shift, layout);
-            } else {
-                let pair = (0xD800..0xDC00).contains(&unit) && i + 1 < units.len();
-                let chars = if pair { vec![unit, units[i + 1]] } else { vec![unit] };
-                let mut inputs: Vec<INPUT> = chars.iter().map(|&u| keyboard_input(0, u, KEYEVENTF_UNICODE)).collect();
-                inputs.extend(chars.iter().map(|&u| keyboard_input(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)));
-                send(&inputs);
-                std::thread::sleep(UNICODE_GAP);
-                if pair {
-                    i += 1;
-                }
+            if !super::secure::type_text(text) {
+                tracing::debug!("input: helper text forwarding failed; not replaying as keys");
             }
-            i += 1;
+            // True means this backend handled the request, not application delivery.
+            return true;
+        }
+        // Modifiers already forwarded by the viewer must not turn resolved text into a
+        // shortcut. Only lift Glass-owned Ctrl/Alt/Win, leaving Shift held for IMEs.
+        let modifiers: Vec<_> = self.held.iter().copied().filter(|&k| keymap::is_text_modifier(k)).collect();
+        if modifiers.iter().any(|&k| k == LEFT_WIN || k == RIGHT_WIN) {
+            send(&[keyboard(MASK, true), keyboard(MASK, false)]);
+            self.mask_win = true;
+        }
+        if !modifiers.is_empty() {
+            send(&modifiers.iter().map(|&k| keyboard(k, false)).collect::<Vec<_>>());
+            settle();
+        }
+        for ch in text.chars() {
+            if ch == '\n' {
+                // Enter is an explicit action; don't release a physical Enter being held.
+                let enter = Key::Scan(0x1C, false);
+                if self.held.contains(&enter) { send(&[keyboard(enter, true)]); }
+                else { tap(enter); }
+            } else {
+                send(&unicode_inputs(ch));
+                std::thread::sleep(UNICODE_GAP);
+            }
+        }
+        if !modifiers.is_empty() {
+            // Keep the last text/Enter event clear of the restored shortcut modifiers.
+            settle();
+            send(&modifiers.iter().map(|&k| keyboard(k, true)).collect::<Vec<_>>());
+            settle();
         }
         true
     }
@@ -704,6 +664,25 @@ impl crate::media::InputSink for Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_text_packets_are_layout_free_and_keep_surrogate_pairs_together() {
+        let fields = |ch| unicode_inputs(ch).into_iter().map(|i| unsafe {
+            let k = i.Anonymous.ki;
+            (k.wVk.0, k.wScan, k.dwFlags)
+        }).collect::<Vec<_>>();
+        for (ch, unit) in [('z', 0x007A), ('@', 0x0040), ('č', 0x010D), (' ', 0x0020)] {
+            assert_eq!(fields(ch), vec![
+                (0, unit, KEYEVENTF_UNICODE),
+                (0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+            ]);
+        }
+        assert_eq!(fields('😀'), vec![
+            (0, 0xD83D, KEYEVENTF_UNICODE), (0, 0xDE00, KEYEVENTF_UNICODE),
+            (0, 0xD83D, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+            (0, 0xDE00, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+        ]);
+    }
 
     #[test]
     fn modifiers_go_as_virtual_keys_and_other_keys_as_scan_codes() {

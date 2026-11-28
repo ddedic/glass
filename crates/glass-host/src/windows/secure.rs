@@ -228,6 +228,21 @@ pub fn send_input(ev: &Ev) -> bool {
     send(OP_INPUT, &ev.write())
 }
 
+/// Keep one text message's chunks together with respect to other pipe writers. A failed
+/// write drops the link; callers must not replay a potentially delivered prefix as keys.
+pub fn type_text(text: &str) -> bool {
+    let link = LINK.lock().unwrap().clone();
+    let Some(link) = link else { return false };
+    let ok = {
+        let _turn = link.writing.lock().unwrap();
+        let mut w = &*link.pipe;
+        glass_proto::text_events(text).iter().all(|ev|
+            w.write_all(&[OP_INPUT]).and_then(|_| w.write_all(&ev.write())).is_ok())
+    };
+    if !ok { link_ended(&link.pipe); }
+    ok
+}
+
 pub fn move_abs(x: i32, y: i32) -> bool {
     let mut p = [0u8; 8];
     p[0..4].copy_from_slice(&x.to_le_bytes());
@@ -511,12 +526,21 @@ fn write_frame(writer: &Mutex<Arc<Pipe>>, frame: &EncodedFrame) -> bool {
 fn inject_loop(rx: std::sync::mpsc::Receiver<InputCmd>) {
     // Stream 0 is the helper's main-display capture, which is what viewers see while locked.
     let mut injector = super::input::Injector::new(0);
+    let mut text = glass_proto::TextReader::default();
     while let Ok(cmd) = rx.recv() {
         retarget_input_desktop();
         match cmd {
+            InputCmd::Event(ev @ Ev::Text { .. }) => {
+                if let Some(value) = text.push(&ev) {
+                    crate::media::InputSink::type_text(&mut injector, &value);
+                }
+            }
             InputCmd::Event(ev) => injector.handle(ev),
             InputCmd::MoveAbs(x, y) => injector.move_abs(x, y),
-            InputCmd::Release => injector.release_all(),
+            InputCmd::Release => {
+                text = glass_proto::TextReader::default();
+                injector.release_all();
+            }
             InputCmd::Paste => injector.paste(),
         }
     }
